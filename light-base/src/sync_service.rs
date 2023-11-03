@@ -408,6 +408,10 @@ impl<TPlat: PlatformRef> SyncService<TPlat> {
                 Err(_) => continue,
             };
 
+            if result.is_empty() {
+                continue
+            }
+
             return Ok(result.remove(0));
         }
 
