@@ -33,7 +33,7 @@
 use crate::{
     chain::{blocks_tree, chain_information},
     executor::host,
-    finality::grandpa,
+    finality::decode,
     header,
     sync::{all_forks, optimistic, warp_sync},
     trie::Nibble,
@@ -1380,11 +1380,11 @@ impl<TRq, TSrc, TBl> AllSync<TRq, TSrc, TBl> {
                 }
             }
             (AllSyncInner::WarpSync { inner, .. }, SourceMapping::WarpSync(source_id)) => {
-                let block_number = match grandpa::commit::decode::decode_grandpa_commit(
+                let block_number = match decode::decode_grandpa_commit(
                     &scale_encoded_message,
                     inner.block_number_bytes(),
                 ) {
-                    Ok(msg) => msg.message.target_number,
+                    Ok(msg) => msg.target_number,
                     Err(_) => return GrandpaCommitMessageOutcome::Discarded,
                 };
 
@@ -1878,6 +1878,7 @@ pub enum DesiredRequest {
 
 impl DesiredRequest {
     /// Caps the number of blocks to request to `max`.
+    // TODO: consider removing due to the many types of requests
     pub fn num_blocks_clamp(&mut self, max: NonZeroU64) {
         if let DesiredRequest::BlocksRequest { num_blocks, .. } = self {
             *num_blocks = NonZeroU64::new(cmp::min(num_blocks.get(), max.get())).unwrap();
@@ -1885,6 +1886,7 @@ impl DesiredRequest {
     }
 
     /// Caps the number of blocks to request to `max`.
+    // TODO: consider removing due to the many types of requests
     pub fn with_num_blocks_clamp(mut self, max: NonZeroU64) -> Self {
         self.num_blocks_clamp(max);
         self

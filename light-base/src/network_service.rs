@@ -32,26 +32,32 @@
 //! the service. The public API only allows emitting requests and notifications towards the
 //! already-connected nodes.
 //!
+//! After a [`NetworkService`] is created, one can add chains using [`NetworkService::add_chain`].
+//! If all references to a [`NetworkServiceChain`] are destroyed, the chain is automatically
+//! purged.
+//!
 //! An important part of the API is the list of channel receivers of [`Event`] returned by
-//! [`NetworkService::new`]. These channels inform the foreground about updates to the network
-//! connectivity.
+//! [`NetworkServiceChain::subscribe`]. These channels inform the foreground about updates to the
+//! network connectivity.
 
 use crate::platform::{self, address_parse, PlatformRef};
 
 use alloc::{
     borrow::ToOwned as _,
     boxed::Box,
+    collections::BTreeMap,
     format,
     string::{String, ToString as _},
     sync::Arc,
     vec::{self, Vec},
 };
-use core::{cmp, mem, pin::Pin, task::Poll, time::Duration};
+use core::{cmp, mem, num::NonZeroUsize, pin::Pin, time::Duration};
 use futures_channel::oneshot;
 use futures_lite::FutureExt as _;
 use futures_util::{future, stream, StreamExt as _};
 use hashbrown::{HashMap, HashSet};
 use itertools::Itertools as _;
+use rand::seq::IteratorRandom as _;
 use rand_chacha::rand_core::SeedableRng as _;
 use smoldot::{
     header,
@@ -61,9 +67,10 @@ use smoldot::{
         multiaddr::{self, Multiaddr},
         peer_id::{self, PeerId},
     },
-    network::{basic_peering_strategy, protocol, service},
+    network::{basic_peering_strategy, codec, service},
 };
 
+pub use codec::Role;
 pub use service::{ChainId, EncodedMerkleProof, QueueNotificationError};
 
 mod tasks;
@@ -76,21 +83,33 @@ pub struct Config<TPlat> {
     /// Value sent back for the agent version when receiving an identification request.
     pub identify_agent_version: String,
 
-    /// Number of event receivers returned by [`NetworkService::new`].
-    pub num_events_receivers: usize,
+    /// Capacity to allocate for the list of chains.
+    pub chains_capacity: usize,
 
-    /// List of chains to connect to. Chains are later referred to by their index in this list.
-    pub chains: Vec<ConfigChain>,
+    /// Maximum number of connections that the service can open simultaneously. After this value
+    /// has been reached, a new connection can be opened after each
+    /// [`Config::connections_open_pool_restore_delay`].
+    pub connections_open_pool_size: u32,
+
+    /// Delay after which the service can open a new connection.
+    /// The delay is cumulative. If no connection has been opened for example for twice this
+    /// duration, then two connections can be opened at the same time, up to a maximum of
+    /// [`Config::connections_open_pool_size`].
+    pub connections_open_pool_restore_delay: Duration,
 }
 
-/// See [`Config::chains`].
+/// See [`NetworkService::add_chain`].
 ///
 /// Note that this configuration is intentionally missing a field containing the bootstrap
 /// nodes of the chain. Bootstrap nodes are supposed to be added afterwards by calling
-/// [`NetworkService::discover`].
+/// [`NetworkServiceChain::discover`].
 pub struct ConfigChain {
     /// Name of the chain, for logging purposes.
     pub log_name: String,
+
+    /// Number of "out slots" of this chain. We establish simultaneously gossip substreams up to
+    /// this number of peers.
+    pub num_out_slots: usize,
 
     /// Hash of the genesis block of the chain. Sent to other nodes in order to determine whether
     /// the chains match.
@@ -100,7 +119,7 @@ pub struct ConfigChain {
     pub genesis_block_hash: [u8; 32],
 
     /// Number and hash of the current best block. Can later be updated with
-    /// [`NetworkService::set_local_best_block`].
+    /// [`NetworkServiceChain::set_local_best_block`].
     pub best_block: (u64, [u8; 32]),
 
     /// Optional identifier to insert into the networking protocol names. Used to differentiate
@@ -116,43 +135,20 @@ pub struct ConfigChain {
 }
 
 pub struct NetworkService<TPlat: PlatformRef> {
-    /// Names of the various chains the network service connects to. Used only for logging
-    /// purposes.
-    log_chain_names: hashbrown::HashMap<ChainId, String, fnv::FnvBuildHasher>,
-
-    /// Channel to send messages to the background task.
+    /// Channel connected to the background service.
     messages_tx: async_channel::Sender<ToBackground>,
 
-    /// Event notified when the [`NetworkService`] is destroyed.
-    on_service_killed: event_listener::Event,
-
-    /// Dummy to hold the `TPlat` type.
-    marker: core::marker::PhantomData<TPlat>,
+    /// See [`Config::platform`].
+    platform: TPlat,
 }
 
 impl<TPlat: PlatformRef> NetworkService<TPlat> {
     /// Initializes the network service with the given configuration.
-    ///
-    /// Returns the networking service, plus a list of receivers on which events are pushed.
-    /// All of these receivers must be polled regularly to prevent the networking service from
-    /// slowing down.
-    pub fn new(
-        config: Config<TPlat>,
-    ) -> (
-        Arc<Self>,
-        Vec<ChainId>,
-        Vec<stream::BoxStream<'static, Event>>,
-    ) {
-        let (event_senders, event_receivers): (Vec<_>, Vec<_>) = (0..config.num_events_receivers)
-            .map(|_| async_channel::bounded(16))
-            .unzip();
+    pub fn new(config: Config<TPlat>) -> Arc<Self> {
+        let (main_messages_tx, main_messages_rx) = async_channel::bounded(4);
 
-        let mut log_chain_names =
-            hashbrown::HashMap::with_capacity_and_hasher(config.chains.len(), Default::default());
-        let mut chain_ids = Vec::with_capacity(config.chains.len());
-
-        let mut network = service::ChainNetwork::new(service::Config {
-            chains_capacity: config.chains.len(),
+        let network = service::ChainNetwork::new(service::Config {
+            chains_capacity: config.chains_capacity,
             connections_capacity: 32,
             handshake_timeout: Duration::from_secs(8),
             randomness_seed: {
@@ -162,107 +158,49 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
             },
         });
 
-        for chain in config.chains {
-            // TODO: can panic in case of duplicate chain, how do we handle that?
-            let chain_id = network
-                .add_chain(service::ChainConfig {
-                    grandpa_protocol_config: chain.grandpa_protocol_finalized_block_height.map(
-                        |commit_finalized_height| service::GrandpaState {
-                            commit_finalized_height,
-                            round_number: 1,
-                            set_id: 0,
-                        },
-                    ),
-                    fork_id: chain.fork_id.clone(),
-                    block_number_bytes: chain.block_number_bytes,
-                    best_hash: chain.best_block.1,
-                    best_number: chain.best_block.0,
-                    genesis_hash: chain.genesis_block_hash,
-                    role: protocol::Role::Light,
-                    allow_inbound_block_requests: false,
-                    user_data: Chain {
-                        log_name: chain.log_name.clone(),
-                    },
-                })
-                .unwrap();
-
-            log_chain_names.insert(chain_id, chain.log_name);
-            chain_ids.push(chain_id);
-        }
-
-        let on_service_killed = event_listener::Event::new();
-
-        let (messages_tx, messages_rx) = async_channel::bounded(32);
-        let messages_rx = Box::pin(messages_rx);
-
-        // Spawn task starts a discovery request at a periodic interval.
-        // This is done through a separate task due to ease of implementation.
-        config.platform.spawn_task(
-            "network-discovery".into(),
-            Box::pin({
-                let platform = config.platform.clone();
-                let messages_tx = messages_tx.clone();
-                async move {
-                    let mut next_discovery = Duration::from_secs(5);
-
-                    loop {
-                        platform.sleep(next_discovery).await;
-                        next_discovery = cmp::min(next_discovery * 2, Duration::from_secs(120));
-
-                        if messages_tx
-                            .send(ToBackground::StartDiscovery)
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-                .or(on_service_killed.listen())
-            }),
-        );
-
         // Spawn main task that processes the network service.
-        let task = Box::pin(
-            background_task(BackgroundTask {
-                randomness: rand_chacha::ChaCha20Rng::from_seed({
-                    let mut seed = [0; 32];
-                    config.platform.fill_random_bytes(&mut seed);
-                    seed
-                }),
-                identify_agent_version: config.identify_agent_version,
-                messages_tx: messages_tx.clone(),
-                peering_strategy: basic_peering_strategy::BasicPeeringStrategy::new(
-                    basic_peering_strategy::Config {
-                        randomness_seed: {
-                            let mut seed = [0; 32];
-                            config.platform.fill_random_bytes(&mut seed);
-                            seed
-                        },
-                        peers_capacity: 50, // TODO: ?
-                        chains_capacity: network.chains().count(),
+        let (tasks_messages_tx, tasks_messages_rx) = async_channel::bounded(32);
+        let task = Box::pin(background_task(BackgroundTask {
+            randomness: rand_chacha::ChaCha20Rng::from_seed({
+                let mut seed = [0; 32];
+                config.platform.fill_random_bytes(&mut seed);
+                seed
+            }),
+            identify_agent_version: config.identify_agent_version,
+            tasks_messages_tx,
+            tasks_messages_rx: Box::pin(tasks_messages_rx),
+            peering_strategy: basic_peering_strategy::BasicPeeringStrategy::new(
+                basic_peering_strategy::Config {
+                    randomness_seed: {
+                        let mut seed = [0; 32];
+                        config.platform.fill_random_bytes(&mut seed);
+                        seed
                     },
-                ),
-                network,
-                platform: config.platform.clone(),
-                event_senders: either::Left(event_senders),
-                important_nodes: HashSet::with_capacity_and_hasher(16, Default::default()),
-                active_connections: HashMap::with_capacity_and_hasher(32, Default::default()),
-                messages_rx,
-                blocks_requests: HashMap::with_capacity_and_hasher(8, Default::default()),
-                grandpa_warp_sync_requests: HashMap::with_capacity_and_hasher(
-                    8,
-                    Default::default(),
-                ),
-                storage_proof_requests: HashMap::with_capacity_and_hasher(8, Default::default()),
-                call_proof_requests: HashMap::with_capacity_and_hasher(8, Default::default()),
-                kademlia_find_node_requests: HashMap::with_capacity_and_hasher(
-                    2,
-                    Default::default(),
-                ),
-            })
-            .or(on_service_killed.listen()),
-        );
+                    peers_capacity: 50, // TODO: ?
+                    chains_capacity: config.chains_capacity,
+                },
+            ),
+            network,
+            connections_open_pool_size: config.connections_open_pool_size,
+            connections_open_pool_restore_delay: config.connections_open_pool_restore_delay,
+            num_recent_connection_opening: 0,
+            next_recent_connection_restore: None,
+            platform: config.platform.clone(),
+            open_gossip_links: BTreeMap::new(),
+            event_pending_send: None,
+            event_senders: either::Left(Vec::new()),
+            pending_new_subscriptions: Vec::new(),
+            important_nodes: HashSet::with_capacity_and_hasher(16, Default::default()),
+            main_messages_rx: Box::pin(main_messages_rx),
+            messages_rx: stream::SelectAll::new(),
+            blocks_requests: HashMap::with_capacity_and_hasher(8, Default::default()),
+            grandpa_warp_sync_requests: HashMap::with_capacity_and_hasher(8, Default::default()),
+            storage_proof_requests: HashMap::with_capacity_and_hasher(8, Default::default()),
+            call_proof_requests: HashMap::with_capacity_and_hasher(8, Default::default()),
+            next_discovery_period: Duration::from_secs(5),
+            next_discovery: Box::pin(config.platform.sleep(Duration::from_secs(5))),
+            kademlia_find_node_requests: HashMap::with_capacity_and_hasher(2, Default::default()),
+        }));
 
         config
             .platform
@@ -271,27 +209,113 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
                 log::debug!(target: "network", "Shutdown")
             });
 
-        let final_network_service = Arc::new(NetworkService {
-            log_chain_names,
-            messages_tx,
-            on_service_killed,
-            marker: core::marker::PhantomData,
+        Arc::new(NetworkService {
+            messages_tx: main_messages_tx,
+            platform: config.platform,
+        })
+    }
+
+    /// Adds a chain to the list of chains that the network service connects to.
+    ///
+    /// Returns an object representing the chain and that allows interacting with it. If all
+    /// references to [`NetworkServiceChain`] are destroyed, the network service automatically
+    /// purges that chain.
+    pub fn add_chain(&self, config: ConfigChain) -> Arc<NetworkServiceChain<TPlat>> {
+        let log_name = config.log_name.clone();
+
+        let (messages_tx, messages_rx) = async_channel::bounded(32);
+
+        // TODO: this code is hacky because we don't want to make `add_chain` async at the moment, because it's not convenient for lib.rs
+        self.platform.spawn_task("add-chain-message-send".into(), {
+            let config = service::ChainConfig {
+                grandpa_protocol_config: config.grandpa_protocol_finalized_block_height.map(
+                    |commit_finalized_height| service::GrandpaState {
+                        commit_finalized_height,
+                        round_number: 1,
+                        set_id: 0,
+                    },
+                ),
+                fork_id: config.fork_id.clone(),
+                block_number_bytes: config.block_number_bytes,
+                best_hash: config.best_block.1,
+                best_number: config.best_block.0,
+                genesis_hash: config.genesis_block_hash,
+                role: Role::Light,
+                allow_inbound_block_requests: false,
+                user_data: Chain {
+                    log_name: config.log_name.clone(),
+                    block_number_bytes: config.block_number_bytes,
+                    num_out_slots: config.num_out_slots,
+                    num_references: NonZeroUsize::new(1).unwrap(),
+                },
+            };
+
+            let messages_tx = self.messages_tx.clone();
+            async move {
+                let _ = messages_tx
+                    .send(ToBackground::AddChain {
+                        messages_rx,
+                        config,
+                    })
+                    .await;
+            }
         });
 
-        // Adjust the event receivers to keep the `final_network_service` alive.
-        let event_receivers = event_receivers
-            .into_iter()
-            .map(|rx| {
-                let mut final_network_service = Some(final_network_service.clone());
-                rx.chain(stream::poll_fn(move |_| {
-                    drop(final_network_service.take());
-                    Poll::Ready(None)
-                }))
-                .boxed()
-            })
-            .collect();
+        Arc::new(NetworkServiceChain {
+            _keep_alive_messages_tx: self.messages_tx.clone(),
+            log_name,
+            messages_tx,
+            marker: core::marker::PhantomData,
+        })
+    }
+}
 
-        (final_network_service, chain_ids, event_receivers)
+pub struct NetworkServiceChain<TPlat: PlatformRef> {
+    /// Copy of [`NetworkService::messages_tx`]. Used in order to maintain the network service
+    /// background task alive.
+    _keep_alive_messages_tx: async_channel::Sender<ToBackground>,
+
+    /// Logging name of the chain.
+    log_name: String,
+
+    /// Channel to send messages to the background task.
+    messages_tx: async_channel::Sender<ToBackgroundChain>,
+
+    /// Dummy to hold the `TPlat` type.
+    marker: core::marker::PhantomData<TPlat>,
+}
+
+impl<TPlat: PlatformRef> NetworkServiceChain<TPlat> {
+    /// Subscribes to the networking events that happen on the given chain.
+    ///
+    /// Calling this function returns a `Receiver` that receives events about the chain.
+    /// The new channel will immediately receive events about all the existing connections, so
+    /// that it is able to maintain a coherent view of the network.
+    ///
+    /// Note that this function is `async`, but it should return very quickly.
+    ///
+    /// The `Receiver` **must** be polled continuously. When the channel is full, the networking
+    /// connections will be back-pressured until the channel isn't full anymore.
+    ///
+    /// The `Receiver` never yields `None` unless the [`NetworkService`] crashes or is destroyed.
+    /// If `None` is yielded and the [`NetworkService`] is still alive, you should call
+    /// [`NetworkServiceChain::subscribe`] again to obtain a new `Receiver`.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the given [`ChainId`] is invalid.
+    ///
+    // TODO: consider not killing the background until the channel is destroyed, as that would be a more sensical behaviour
+    pub async fn subscribe(&self) -> async_channel::Receiver<Event> {
+        let (tx, rx) = async_channel::bounded(128);
+
+        let _ = self
+            .messages_tx
+            .send(ToBackgroundChain::Subscribe { sender: tx })
+            .await
+            .unwrap();
+
+        rx
     }
 
     /// Sends a blocks request to the given peer.
@@ -299,16 +323,14 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
     pub async fn blocks_request(
         self: Arc<Self>,
         target: PeerId,
-        chain_id: ChainId,
-        config: protocol::BlocksRequestConfig,
+        config: codec::BlocksRequestConfig,
         timeout: Duration,
-    ) -> Result<Vec<protocol::BlockData>, BlocksRequestError> {
+    ) -> Result<Vec<codec::BlockData>, BlocksRequestError> {
         let (tx, rx) = oneshot::channel();
 
         self.messages_tx
-            .send(ToBackground::StartBlocksRequest {
+            .send(ToBackgroundChain::StartBlocksRequest {
                 target: target.clone(),
-                chain_id,
                 config,
                 timeout,
                 result: tx,
@@ -324,7 +346,7 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
                     target: "network",
                     "Connections({}) => BlocksRequest(chain={}, num_blocks={}, block_data_total_size={})",
                     target,
-                    self.log_chain_names[&chain_id],
+                    self.log_name,
                     blocks.len(),
                     BytesDisplay(blocks.iter().fold(0, |sum, block| {
                         let block_size = block.header.as_ref().map_or(0, |h| h.len()) +
@@ -339,7 +361,7 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
                     target: "network",
                     "Connections({}) => BlocksRequest(chain={}, error={:?})",
                     target,
-                    self.log_chain_names[&chain_id],
+                    self.log_name,
                     err
                 );
             }
@@ -369,16 +391,14 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
     pub async fn grandpa_warp_sync_request(
         self: Arc<Self>,
         target: PeerId,
-        chain_id: ChainId,
         begin_hash: [u8; 32],
         timeout: Duration,
     ) -> Result<service::EncodedGrandpaWarpSyncResponse, WarpSyncRequestError> {
         let (tx, rx) = oneshot::channel();
 
         self.messages_tx
-            .send(ToBackground::StartWarpSyncRequest {
+            .send(ToBackgroundChain::StartWarpSyncRequest {
                 target: target.clone(),
-                chain_id,
                 begin_hash,
                 timeout,
                 result: tx,
@@ -396,7 +416,7 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
                     target: "network",
                     "Connections({}) => WarpSyncRequest(chain={}, num_fragments={}, finished={:?})",
                     target,
-                    self.log_chain_names[&chain_id],
+                    self.log_name,
                     decoded.fragments.len(),
                     decoded.is_finished,
                 );
@@ -406,7 +426,7 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
                     target: "network",
                     "Connections({}) => WarpSyncRequest(chain={}, error={:?})",
                     target,
-                    self.log_chain_names[&chain_id],
+                    self.log_name,
                     err,
                 );
             }
@@ -415,15 +435,9 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
         result
     }
 
-    pub async fn set_local_best_block(
-        &self,
-        chain_id: ChainId,
-        best_hash: [u8; 32],
-        best_number: u64,
-    ) {
+    pub async fn set_local_best_block(&self, best_hash: [u8; 32], best_number: u64) {
         self.messages_tx
-            .send(ToBackground::SetLocalBestBlock {
-                chain_id,
+            .send(ToBackgroundChain::SetLocalBestBlock {
                 best_hash,
                 best_number,
             })
@@ -431,16 +445,9 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
             .unwrap();
     }
 
-    pub async fn set_local_grandpa_state(
-        &self,
-        chain_id: ChainId,
-        grandpa_state: service::GrandpaState,
-    ) {
+    pub async fn set_local_grandpa_state(&self, grandpa_state: service::GrandpaState) {
         self.messages_tx
-            .send(ToBackground::SetLocalGrandpaState {
-                chain_id,
-                grandpa_state,
-            })
+            .send(ToBackgroundChain::SetLocalGrandpaState { grandpa_state })
             .await
             .unwrap();
     }
@@ -449,18 +456,16 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
     // TODO: more docs
     pub async fn storage_proof_request(
         self: Arc<Self>,
-        chain_id: ChainId,
         target: PeerId, // TODO: takes by value because of futures longevity issue
-        config: protocol::StorageProofRequestConfig<impl Iterator<Item = impl AsRef<[u8]> + Clone>>,
+        config: codec::StorageProofRequestConfig<impl Iterator<Item = impl AsRef<[u8]> + Clone>>,
         timeout: Duration,
     ) -> Result<service::EncodedMerkleProof, StorageProofRequestError> {
         let (tx, rx) = oneshot::channel();
 
         self.messages_tx
-            .send(ToBackground::StartStorageProofRequest {
+            .send(ToBackgroundChain::StartStorageProofRequest {
                 target: target.clone(),
-                chain_id,
-                config: protocol::StorageProofRequestConfig {
+                config: codec::StorageProofRequestConfig {
                     block_hash: config.block_hash,
                     keys: config
                         .keys
@@ -483,7 +488,7 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
                     target: "network",
                     "Connections({}) => StorageProofRequest(chain={}, total_size={})",
                     target,
-                    self.log_chain_names[&chain_id],
+                    self.log_name,
                     BytesDisplay(u64::try_from(decoded.len()).unwrap()),
                 );
             }
@@ -492,7 +497,7 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
                     target: "network",
                     "Connections({}) => StorageProofRequest(chain={}, error={:?})",
                     target,
-                    self.log_chain_names[&chain_id],
+                    self.log_name,
                     err
                 );
             }
@@ -503,22 +508,20 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
 
     /// Sends a call proof request to the given peer.
     ///
-    /// See also [`NetworkService::call_proof_request`].
+    /// See also [`NetworkServiceChain::call_proof_request`].
     // TODO: more docs
     pub async fn call_proof_request(
         self: Arc<Self>,
-        chain_id: ChainId,
         target: PeerId, // TODO: takes by value because of futures longevity issue
-        config: protocol::CallProofRequestConfig<'_, impl Iterator<Item = impl AsRef<[u8]>>>,
+        config: codec::CallProofRequestConfig<'_, impl Iterator<Item = impl AsRef<[u8]>>>,
         timeout: Duration,
     ) -> Result<EncodedMerkleProof, CallProofRequestError> {
         let (tx, rx) = oneshot::channel();
 
         self.messages_tx
-            .send(ToBackground::StartCallProofRequest {
+            .send(ToBackgroundChain::StartCallProofRequest {
                 target: target.clone(),
-                chain_id,
-                config: protocol::CallProofRequestConfig {
+                config: codec::CallProofRequestConfig {
                     block_hash: config.block_hash,
                     method: config.method.into_owned().into(),
                     parameter_vectored: config
@@ -542,7 +545,7 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
                     target: "network",
                     "Connections({}) => CallProofRequest({}, total_size: {})",
                     target,
-                    self.log_chain_names[&chain_id],
+                    self.log_name,
                     BytesDisplay(u64::try_from(decoded.len()).unwrap())
                 );
             }
@@ -551,7 +554,7 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
                     target: "network",
                     "Connections({}) => CallProofRequest({}, {})",
                     target,
-                    self.log_chain_names[&chain_id],
+                    self.log_name,
                     err
                 );
             }
@@ -569,16 +572,11 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
     /// networking is inherently unreliable, successfully sending a transaction to a peer doesn't
     /// necessarily mean that the remote has received it. In practice, however, the likelihood of
     /// a transaction not being received are extremely low. This can be considered as known flaw.
-    pub async fn announce_transaction(
-        self: Arc<Self>,
-        chain_id: ChainId,
-        transaction: &[u8],
-    ) -> Vec<PeerId> {
+    pub async fn announce_transaction(self: Arc<Self>, transaction: &[u8]) -> Vec<PeerId> {
         let (tx, rx) = oneshot::channel();
 
         self.messages_tx
-            .send(ToBackground::AnnounceTransaction {
-                chain_id,
+            .send(ToBackgroundChain::AnnounceTransaction {
                 transaction: transaction.to_vec(), // TODO: ovheread
                 result: tx,
             })
@@ -592,16 +590,14 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
     pub async fn send_block_announce(
         self: Arc<Self>,
         target: &PeerId,
-        chain_id: ChainId,
         scale_encoded_header: &[u8],
         is_best: bool,
     ) -> Result<(), QueueNotificationError> {
         let (tx, rx) = oneshot::channel();
 
         self.messages_tx
-            .send(ToBackground::SendBlockAnnounce {
-                target: target.clone(), // TODO: overhead
-                chain_id,
+            .send(ToBackgroundChain::SendBlockAnnounce {
+                target: target.clone(),                              // TODO: overhead
                 scale_encoded_header: scale_encoded_header.to_vec(), // TODO: overhead
                 is_best,
                 result: tx,
@@ -619,13 +615,11 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
     /// and should have additional logging.
     pub async fn discover(
         &self,
-        chain_id: ChainId,
         list: impl IntoIterator<Item = (PeerId, impl IntoIterator<Item = Multiaddr>)>,
         important_nodes: bool,
     ) {
         self.messages_tx
-            .send(ToBackground::Discover {
-                chain_id,
+            .send(ToBackgroundChain::Discover {
                 // TODO: overhead
                 list: list
                     .into_iter()
@@ -644,19 +638,15 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
     /// the network.
     ///
     /// Nodes that are discovered might disappear over time. In other words, there is no guarantee
-    /// that a node that has been added through [`NetworkService::discover`] will later be
-    /// returned by [`NetworkService::discovered_nodes`].
+    /// that a node that has been added through [`NetworkServiceChain::discover`] will later be
+    /// returned by [`NetworkServiceChain::discovered_nodes`].
     pub async fn discovered_nodes(
         &self,
-        chain_id: ChainId,
     ) -> impl Iterator<Item = (PeerId, impl Iterator<Item = Multiaddr>)> {
         let (tx, rx) = oneshot::channel();
 
         self.messages_tx
-            .send(ToBackground::DiscoveredNodes {
-                chain_id,
-                result: tx,
-            })
+            .send(ToBackgroundChain::DiscoveredNodes { result: tx })
             .await
             .unwrap();
 
@@ -668,22 +658,13 @@ impl<TPlat: PlatformRef> NetworkService<TPlat> {
 
     /// Returns an iterator to the list of [`PeerId`]s that we have an established connection
     /// with.
-    pub async fn peers_list(&self, chain_id: ChainId) -> impl Iterator<Item = PeerId> {
+    pub async fn peers_list(&self) -> impl Iterator<Item = PeerId> {
         let (tx, rx) = oneshot::channel();
         self.messages_tx
-            .send(ToBackground::PeersList {
-                chain_id,
-                result: tx,
-            })
+            .send(ToBackgroundChain::PeersList { result: tx })
             .await
             .unwrap();
         rx.await.unwrap().into_iter()
-    }
-}
-
-impl<TPlat: PlatformRef> Drop for NetworkService<TPlat> {
-    fn drop(&mut self) {
-        self.on_service_killed.notify(usize::max_value());
     }
 }
 
@@ -692,34 +673,29 @@ impl<TPlat: PlatformRef> Drop for NetworkService<TPlat> {
 pub enum Event {
     Connected {
         peer_id: PeerId,
-        chain_id: ChainId,
-        role: protocol::Role,
+        role: Role,
         best_block_number: u64,
         best_block_hash: [u8; 32],
     },
     Disconnected {
         peer_id: PeerId,
-        chain_id: ChainId,
     },
     BlockAnnounce {
         peer_id: PeerId,
-        chain_id: ChainId,
         announce: service::EncodedBlockAnnounce,
     },
     GrandpaNeighborPacket {
         peer_id: PeerId,
-        chain_id: ChainId,
         finalized_block_height: u64,
     },
     /// Received a GrandPa commit message from the network.
     GrandpaCommitMessage {
         peer_id: PeerId,
-        chain_id: ChainId,
         message: service::EncodedGrandpaCommitMessage,
     },
 }
 
-/// Error returned by [`NetworkService::blocks_request`].
+/// Error returned by [`NetworkServiceChain::blocks_request`].
 #[derive(Debug, derive_more::Display)]
 pub enum BlocksRequestError {
     /// No established connection with the target.
@@ -729,7 +705,7 @@ pub enum BlocksRequestError {
     Request(service::BlocksRequestError),
 }
 
-/// Error returned by [`NetworkService::grandpa_warp_sync_request`].
+/// Error returned by [`NetworkServiceChain::grandpa_warp_sync_request`].
 #[derive(Debug, derive_more::Display)]
 pub enum WarpSyncRequestError {
     /// No established connection with the target.
@@ -739,7 +715,7 @@ pub enum WarpSyncRequestError {
     Request(service::GrandpaWarpSyncRequestError),
 }
 
-/// Error returned by [`NetworkService::storage_proof_request`].
+/// Error returned by [`NetworkServiceChain::storage_proof_request`].
 #[derive(Debug, derive_more::Display, Clone)]
 pub enum StorageProofRequestError {
     /// No established connection with the target.
@@ -751,7 +727,7 @@ pub enum StorageProofRequestError {
     Request(service::StorageProofRequestError),
 }
 
-/// Error returned by [`NetworkService::call_proof_request`].
+/// Error returned by [`NetworkServiceChain::call_proof_request`].
 #[derive(Debug, derive_more::Display, Clone)]
 pub enum CallProofRequestError {
     /// No established connection with the target.
@@ -776,22 +752,27 @@ impl CallProofRequestError {
 }
 
 enum ToBackground {
-    ConnectionMessage {
-        connection_id: service::ConnectionId,
-        message: service::ConnectionToCoordinator,
+    AddChain {
+        messages_rx: async_channel::Receiver<ToBackgroundChain>,
+        config: service::ChainConfig<Chain>,
+    },
+}
+
+enum ToBackgroundChain {
+    RemoveChain,
+    Subscribe {
+        sender: async_channel::Sender<Event>,
     },
     // TODO: serialize the request before sending over channel
     StartBlocksRequest {
         target: PeerId, // TODO: takes by value because of future longevity issue
-        chain_id: ChainId,
-        config: protocol::BlocksRequestConfig,
+        config: codec::BlocksRequestConfig,
         timeout: Duration,
-        result: oneshot::Sender<Result<Vec<protocol::BlockData>, BlocksRequestError>>,
+        result: oneshot::Sender<Result<Vec<codec::BlockData>, BlocksRequestError>>,
     },
     // TODO: serialize the request before sending over channel
     StartWarpSyncRequest {
         target: PeerId,
-        chain_id: ChainId,
         begin_hash: [u8; 32],
         timeout: Duration,
         result:
@@ -799,55 +780,45 @@ enum ToBackground {
     },
     // TODO: serialize the request before sending over channel
     StartStorageProofRequest {
-        chain_id: ChainId,
         target: PeerId,
-        config: protocol::StorageProofRequestConfig<vec::IntoIter<Vec<u8>>>,
+        config: codec::StorageProofRequestConfig<vec::IntoIter<Vec<u8>>>,
         timeout: Duration,
         result: oneshot::Sender<Result<service::EncodedMerkleProof, StorageProofRequestError>>,
     },
     // TODO: serialize the request before sending over channel
     StartCallProofRequest {
-        chain_id: ChainId,
         target: PeerId, // TODO: takes by value because of futures longevity issue
-        config: protocol::CallProofRequestConfig<'static, vec::IntoIter<Vec<u8>>>,
+        config: codec::CallProofRequestConfig<'static, vec::IntoIter<Vec<u8>>>,
         timeout: Duration,
         result: oneshot::Sender<Result<service::EncodedMerkleProof, CallProofRequestError>>,
     },
     SetLocalBestBlock {
-        chain_id: ChainId,
         best_hash: [u8; 32],
         best_number: u64,
     },
     SetLocalGrandpaState {
-        chain_id: ChainId,
         grandpa_state: service::GrandpaState,
     },
     AnnounceTransaction {
-        chain_id: ChainId,
         transaction: Vec<u8>,
         result: oneshot::Sender<Vec<PeerId>>,
     },
     SendBlockAnnounce {
         target: PeerId,
-        chain_id: ChainId,
         scale_encoded_header: Vec<u8>,
         is_best: bool,
         result: oneshot::Sender<Result<(), QueueNotificationError>>,
     },
     Discover {
-        chain_id: ChainId,
         list: vec::IntoIter<(PeerId, vec::IntoIter<Multiaddr>)>,
         important_nodes: bool,
     },
     DiscoveredNodes {
-        chain_id: ChainId,
         result: oneshot::Sender<Vec<(PeerId, Vec<Multiaddr>)>>,
     },
     PeersList {
-        chain_id: ChainId,
         result: oneshot::Sender<Vec<PeerId>>,
     },
-    StartDiscovery,
 }
 
 struct BackgroundTask<TPlat: PlatformRef> {
@@ -861,38 +832,71 @@ struct BackgroundTask<TPlat: PlatformRef> {
     identify_agent_version: String,
 
     /// Channel to send messages to the background task.
-    messages_tx: async_channel::Sender<ToBackground>,
+    tasks_messages_tx:
+        async_channel::Sender<(service::ConnectionId, service::ConnectionToCoordinator)>,
+
+    /// Channel to receive messages destined to the background task.
+    tasks_messages_rx: Pin<
+        Box<async_channel::Receiver<(service::ConnectionId, service::ConnectionToCoordinator)>>,
+    >,
 
     /// Data structure holding the entire state of the networking.
-    network: service::ChainNetwork<Chain, TPlat::Instant>,
+    network: service::ChainNetwork<
+        Chain,
+        async_channel::Sender<service::CoordinatorToConnection>,
+        TPlat::Instant,
+    >,
 
     /// All known peers and their addresses.
     peering_strategy: basic_peering_strategy::BasicPeeringStrategy<ChainId, TPlat::Instant>,
+
+    /// See [`Config::connections_open_pool_size`].
+    connections_open_pool_size: u32,
+
+    /// See [`Config::connections_open_pool_restore_delay`].
+    connections_open_pool_restore_delay: Duration,
+
+    /// Every time a connection is opened, the value in this field is increased by one. After
+    /// [`BackgroundTask::next_recent_connection_restore`] has yielded, the value is reduced by
+    /// one.
+    num_recent_connection_opening: u32,
+
+    /// Delay after which [`BackgroundTask::num_recent_connection_opening`] is increased by one.
+    next_recent_connection_restore: Option<Pin<Box<TPlat::Delay>>>,
+
+    /// List of all open gossip links.
+    // TODO: using this data structure unfortunately means that PeerIds are cloned a lot, maybe some user data in ChainNetwork is better? not sure
+    open_gossip_links: BTreeMap<(ChainId, PeerId), OpenGossipLinkState>,
 
     /// List of nodes that are considered as important for logging purposes.
     // TODO: should also detect whenever we fail to open a block announces substream with any of these peers
     important_nodes: HashSet<PeerId, fnv::FnvBuildHasher>,
 
+    /// Event about to be sent on the senders of [`BackgroundTask::event_senders`].
+    event_pending_send: Option<(ChainId, Event)>,
+
     /// Sending events through the public API.
     ///
     /// Contains either senders, or a `Future` that is currently sending an event and will yield
     /// the senders back once it is finished.
+    // TODO: sort by ChainId instead of using a Vec?
     event_senders: either::Either<
-        Vec<async_channel::Sender<Event>>,
-        Pin<Box<dyn future::Future<Output = Vec<async_channel::Sender<Event>>> + Send>>,
+        Vec<(ChainId, async_channel::Sender<Event>)>,
+        Pin<Box<dyn future::Future<Output = Vec<(ChainId, async_channel::Sender<Event>)>> + Send>>,
     >,
 
-    messages_rx: Pin<Box<async_channel::Receiver<ToBackground>>>,
+    /// Whenever [`NetworkServiceChain::subscribe`] is called, the new sender is added to this list.
+    /// Once [`BackgroundTask::event_senders`] is ready, we properly initialize these senders.
+    pending_new_subscriptions: Vec<(ChainId, async_channel::Sender<Event>)>,
 
-    active_connections: HashMap<
-        service::ConnectionId,
-        async_channel::Sender<service::CoordinatorToConnection>,
-        fnv::FnvBuildHasher,
-    >,
+    main_messages_rx: Pin<Box<async_channel::Receiver<ToBackground>>>,
+
+    messages_rx:
+        stream::SelectAll<Pin<Box<dyn stream::Stream<Item = (ChainId, ToBackgroundChain)> + Send>>>,
 
     blocks_requests: HashMap<
         service::SubstreamId,
-        oneshot::Sender<Result<Vec<protocol::BlockData>, BlocksRequestError>>,
+        oneshot::Sender<Result<Vec<codec::BlockData>, BlocksRequestError>>,
         fnv::FnvBuildHasher,
     >,
 
@@ -914,59 +918,115 @@ struct BackgroundTask<TPlat: PlatformRef> {
         fnv::FnvBuildHasher,
     >,
 
+    next_discovery_period: Duration,
+
+    next_discovery: Pin<Box<TPlat::Delay>>,
+
     kademlia_find_node_requests: HashMap<service::SubstreamId, ChainId, fnv::FnvBuildHasher>,
 }
 
 struct Chain {
     log_name: String,
+
+    // TODO: this field is a hack due to the fact that `add_chain` can't be `async`; should eventually be fixed after a lib.rs refactor
+    num_references: NonZeroUsize,
+
+    /// See [`ConfigChain::block_number_bytes`].
+    // TODO: redundant with ChainNetwork? since we might not need to know this in the future i'm reluctant to add a getter to ChainNetwork
+    block_number_bytes: usize,
+
+    /// See [`ConfigChain::num_out_slots`].
+    num_out_slots: usize,
+}
+
+#[derive(Clone)]
+struct OpenGossipLinkState {
+    role: Role,
+    best_block_number: u64,
+    best_block_hash: [u8; 32],
+    /// `None` if unknown.
+    finalized_block_height: Option<u64>,
 }
 
 async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
     loop {
-        // TODO: this is hacky; instead, should be cleaned up as a response to an event from the service; no such event exists yet
-        task.active_connections.retain(|_, tx| !tx.is_closed());
-
-        enum WhatHappened {
+        enum WakeUpReason {
+            ForegroundClosed,
             Message(ToBackground),
-            NetworkEvent(service::Event),
+            MessageForChain(ChainId, ToBackgroundChain),
+            NetworkEvent(service::Event<async_channel::Sender<service::CoordinatorToConnection>>),
             CanAssignSlot(PeerId, ChainId),
+            NextRecentConnectionRestore,
             CanStartConnect(PeerId),
             CanOpenGossip(PeerId, ChainId),
+            MessageFromConnection {
+                connection_id: service::ConnectionId,
+                message: service::ConnectionToCoordinator,
+            },
             MessageToConnection {
                 connection_id: service::ConnectionId,
                 message: service::CoordinatorToConnection,
             },
             EventSendersReady,
+            StartDiscovery,
         }
 
-        let what_happened = {
-            let message_received =
-                async { WhatHappened::Message(task.messages_rx.next().await.unwrap()) };
-            let can_generate_event = matches!(task.event_senders, either::Left(_));
+        let wake_up_reason = {
+            let message_received = async {
+                task.main_messages_rx
+                    .next()
+                    .await
+                    .map_or(WakeUpReason::ForegroundClosed, WakeUpReason::Message)
+            };
+            let message_for_chain_received = async {
+                // Note that when the last entry of `messages_rx` yields `None`, `messages_rx`
+                // itself will yield `None`. For this reason, we can't use
+                // `task.messages_rx.is_empty()` to determine whether `messages_rx` will
+                // yield `None`.
+                let Some((chain_id, message)) = task.messages_rx.next().await else {
+                    future::pending().await
+                };
+                WakeUpReason::MessageForChain(chain_id, message)
+            };
+            let message_from_task_received = async {
+                let (connection_id, message) = task.tasks_messages_rx.next().await.unwrap();
+                WakeUpReason::MessageFromConnection {
+                    connection_id,
+                    message,
+                }
+            };
             let service_event = async {
-                if let Some(event) = can_generate_event
-                    .then(|| task.network.next_event())
-                    .flatten()
+                if let Some(event) = (task.event_pending_send.is_none()
+                    && task.pending_new_subscriptions.is_empty())
+                .then(|| task.network.next_event())
+                .flatten()
                 {
-                    WhatHappened::NetworkEvent(event)
+                    WakeUpReason::NetworkEvent(event)
                 } else if let Some(start_connect) = {
-                    let x = task.network.unconnected_desired().next().cloned();
+                    let x = (task.num_recent_connection_opening < task.connections_open_pool_size)
+                        .then(|| {
+                            task.network
+                                .unconnected_desired()
+                                .choose(&mut task.randomness)
+                                .cloned()
+                        })
+                        .flatten();
                     x
                 } {
-                    WhatHappened::CanStartConnect(start_connect)
+                    WakeUpReason::CanStartConnect(start_connect)
                 } else if let Some((peer_id, chain_id)) = {
                     let x = task
                         .network
                         .connected_unopened_gossip_desired()
-                        .next()
+                        .choose(&mut task.randomness)
                         .map(|(peer_id, chain_id, _)| (peer_id.clone(), chain_id));
                     x
                 } {
-                    WhatHappened::CanOpenGossip(peer_id, chain_id)
+                    WakeUpReason::CanOpenGossip(peer_id, chain_id)
                 } else if let Some((connection_id, message)) =
                     task.network.pull_message_to_connection()
                 {
-                    WhatHappened::MessageToConnection {
+                    WakeUpReason::MessageToConnection {
                         connection_id,
                         message,
                     }
@@ -975,11 +1035,10 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                         let mut earlier_unban = None;
 
                         for chain_id in task.network.chains().collect::<Vec<_>>() {
-                            // TODO: 4 is an arbitrary constant, make configurable
                             if task.network.gossip_desired_num(
                                 chain_id,
                                 service::GossipKind::ConsensusTransactions,
-                            ) >= 4
+                            ) >= task.network[chain_id].num_out_slots
                             {
                                 continue;
                             }
@@ -989,7 +1048,7 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                                 .pick_assignable_peer(&chain_id, &task.platform.now())
                             {
                                 basic_peering_strategy::AssignablePeer::Assignable(peer_id) => {
-                                    break 'search WhatHappened::CanAssignSlot(
+                                    break 'search WakeUpReason::CanAssignSlot(
                                         peer_id.clone(),
                                         chain_id,
                                     )
@@ -1013,65 +1072,230 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     }
                 }
             };
-            let finished_sending_event = async {
-                if let either::Right(event_sending_future) = &mut task.event_senders {
-                    let event_senders = event_sending_future.await;
-                    task.event_senders = either::Left(event_senders);
-                    WhatHappened::EventSendersReady
+            let next_recent_connection_restore = async {
+                if task.num_recent_connection_opening != 0
+                    && task.next_recent_connection_restore.is_none()
+                {
+                    task.next_recent_connection_restore = Some(Box::pin(
+                        task.platform
+                            .sleep(task.connections_open_pool_restore_delay),
+                    ));
+                }
+                if let Some(delay) = task.next_recent_connection_restore.as_mut() {
+                    delay.await;
+                    task.next_recent_connection_restore = None;
+                    WakeUpReason::NextRecentConnectionRestore
                 } else {
                     future::pending().await
                 }
             };
+            let finished_sending_event = async {
+                if let either::Right(event_sending_future) = &mut task.event_senders {
+                    let event_senders = event_sending_future.await;
+                    task.event_senders = either::Left(event_senders);
+                    WakeUpReason::EventSendersReady
+                } else if task.event_pending_send.is_some()
+                    || !task.pending_new_subscriptions.is_empty()
+                {
+                    WakeUpReason::EventSendersReady
+                } else {
+                    future::pending().await
+                }
+            };
+            let start_discovery = async {
+                (&mut task.next_discovery).await;
+                task.next_discovery_period =
+                    cmp::min(task.next_discovery_period * 2, Duration::from_secs(120));
+                task.next_discovery = Box::pin(task.platform.sleep(task.next_discovery_period));
+                WakeUpReason::StartDiscovery
+            };
 
-            message_received
+            message_for_chain_received
+                .or(message_received)
+                .or(message_from_task_received)
                 .or(service_event)
+                .or(next_recent_connection_restore)
                 .or(finished_sending_event)
+                .or(start_discovery)
                 .await
         };
 
-        let event_to_dispatch: Event = match what_happened {
-            WhatHappened::EventSendersReady => {
-                // Nothing to do. Just loop again, as we can now generate events.
-                continue;
+        match wake_up_reason {
+            WakeUpReason::ForegroundClosed => {
+                // End the task.
+                return;
             }
-            WhatHappened::Message(ToBackground::ConnectionMessage {
+            WakeUpReason::Message(ToBackground::AddChain {
+                messages_rx,
+                config,
+            }) => {
+                // TODO: this is not a completely clean way of handling duplicate chains, because the existing chain might have a different best block and role and all ; also, multiple sync services will call set_best_block and set_finalized_block
+                let chain_id = match task.network.add_chain(config) {
+                    Ok(id) => id,
+                    Err(service::AddChainError::Duplicate { existing_identical }) => {
+                        task.network[existing_identical].num_references = task.network
+                            [existing_identical]
+                            .num_references
+                            .checked_add(1)
+                            .unwrap();
+                        existing_identical
+                    }
+                };
+
+                task.messages_rx
+                    .push(Box::pin(
+                        messages_rx
+                            .map(move |msg| (chain_id, msg))
+                            .chain(stream::once(future::ready((
+                                chain_id,
+                                ToBackgroundChain::RemoveChain,
+                            )))),
+                    ) as Pin<Box<_>>);
+
+                log::debug!(target: "network", "Chains <= AddChain(id={})", task.network[chain_id].log_name);
+            }
+            WakeUpReason::EventSendersReady => {
+                // Dispatch the pending event, if any, to the various senders.
+
+                // We made sure that the senders were ready before generating an event.
+                let either::Left(event_senders) = &mut task.event_senders else {
+                    unreachable!()
+                };
+
+                if let Some((event_to_dispatch_chain_id, event_to_dispatch)) =
+                    task.event_pending_send.take()
+                {
+                    let mut event_senders = mem::take(event_senders);
+                    task.event_senders = either::Right(Box::pin(async move {
+                        // Elements in `event_senders` are removed one by one and inserted
+                        // back if the channel is still open.
+                        for index in (0..event_senders.len()).rev() {
+                            let (event_sender_chain_id, event_sender) =
+                                event_senders.swap_remove(index);
+                            if event_sender_chain_id == event_to_dispatch_chain_id {
+                                if event_sender.send(event_to_dispatch.clone()).await.is_err() {
+                                    continue;
+                                }
+                            }
+                            event_senders.push((event_sender_chain_id, event_sender));
+                        }
+                        event_senders
+                    }));
+                } else if !task.pending_new_subscriptions.is_empty() {
+                    let pending_new_subscriptions = mem::take(&mut task.pending_new_subscriptions);
+                    let mut event_senders = mem::take(event_senders);
+                    // TODO: cloning :-/
+                    let open_gossip_links = task.open_gossip_links.clone();
+                    task.event_senders = either::Right(Box::pin(async move {
+                        for (chain_id, new_subscription) in pending_new_subscriptions {
+                            for ((link_chain_id, peer_id), state) in &open_gossip_links {
+                                // TODO: optimize? this is O(n) by chain
+                                if *link_chain_id != chain_id {
+                                    continue;
+                                }
+
+                                let _ = new_subscription
+                                    .send(Event::Connected {
+                                        peer_id: peer_id.clone(),
+                                        role: state.role,
+                                        best_block_number: state.best_block_number,
+                                        best_block_hash: state.best_block_hash,
+                                    })
+                                    .await;
+
+                                if let Some(finalized_block_height) = state.finalized_block_height {
+                                    let _ = new_subscription
+                                        .send(Event::GrandpaNeighborPacket {
+                                            peer_id: peer_id.clone(),
+                                            finalized_block_height,
+                                        })
+                                        .await;
+                                }
+                            }
+
+                            event_senders.push((chain_id, new_subscription));
+                        }
+
+                        event_senders
+                    }));
+                }
+            }
+            WakeUpReason::MessageFromConnection {
                 connection_id,
                 message,
-            }) => {
+            } => {
                 task.network
                     .inject_connection_message(connection_id, message);
-                continue;
             }
-            WhatHappened::Message(ToBackground::StartBlocksRequest {
-                target,
+            WakeUpReason::MessageForChain(chain_id, ToBackgroundChain::RemoveChain) => {
+                if let Some(new_ref) =
+                    NonZeroUsize::new(task.network[chain_id].num_references.get() - 1)
+                {
+                    task.network[chain_id].num_references = new_ref;
+                    continue;
+                }
+
+                for peer_id in task
+                    .network
+                    .gossip_connected_peers(chain_id, service::GossipKind::ConsensusTransactions)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                {
+                    task.network
+                        .gossip_close(
+                            chain_id,
+                            &peer_id,
+                            service::GossipKind::ConsensusTransactions,
+                        )
+                        .unwrap();
+
+                    let _was_in = task.open_gossip_links.remove(&(chain_id, peer_id));
+                    debug_assert!(_was_in.is_some());
+                }
+
+                // TODO: this is O(n)
+                task.kademlia_find_node_requests
+                    .retain(|_, c| *c != chain_id);
+
+                log::debug!(target: "network", "Chains <= RemoveChain(id={})", task.network[chain_id].log_name);
+                task.network.remove_chain(chain_id).unwrap();
+                task.peering_strategy.remove_chain_peers(&chain_id);
+            }
+            WakeUpReason::MessageForChain(chain_id, ToBackgroundChain::Subscribe { sender }) => {
+                task.pending_new_subscriptions.push((chain_id, sender));
+            }
+            WakeUpReason::MessageForChain(
                 chain_id,
-                config,
-                timeout,
-                result,
-            }) => {
+                ToBackgroundChain::StartBlocksRequest {
+                    target,
+                    config,
+                    timeout,
+                    result,
+                },
+            ) => {
                 match task
                     .network
                     .start_blocks_request(&target, chain_id, config.clone(), timeout)
                 {
                     Ok(substream_id) => {
                         match &config.start {
-                            protocol::BlocksRequestConfigStart::Hash(hash) => {
+                            codec::BlocksRequestConfigStart::Hash(hash) => {
                                 log::debug!(
                                     target: "network",
                                     "Connections({}) <= BlocksRequest(chain={}, start={}, num={}, descending={:?}, header={:?}, body={:?}, justifications={:?})",
                                     target, task.network[chain_id].log_name, HashDisplay(hash),
                                     config.desired_count.get(),
-                                    matches!(config.direction, protocol::BlocksRequestDirection::Descending),
+                                    matches!(config.direction, codec::BlocksRequestDirection::Descending),
                                     config.fields.header, config.fields.body, config.fields.justifications
                                 );
                             }
-                            protocol::BlocksRequestConfigStart::Number(number) => {
+                            codec::BlocksRequestConfigStart::Number(number) => {
                                 log::debug!(
                                     target: "network",
                                     "Connections({}) <= BlocksRequest(chain={}, start=#{}, num={}, descending={:?}, header={:?}, body={:?}, justifications={:?})",
                                     target, task.network[chain_id].log_name, number,
                                     config.desired_count.get(),
-                                    matches!(config.direction, protocol::BlocksRequestDirection::Descending),
+                                    matches!(config.direction, codec::BlocksRequestDirection::Descending),
                                     config.fields.header, config.fields.body, config.fields.justifications
                                 );
                             }
@@ -1083,16 +1307,16 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                         let _ = result.send(Err(BlocksRequestError::NoConnection));
                     }
                 }
-
-                continue;
             }
-            WhatHappened::Message(ToBackground::StartWarpSyncRequest {
-                target,
+            WakeUpReason::MessageForChain(
                 chain_id,
-                begin_hash,
-                timeout,
-                result,
-            }) => {
+                ToBackgroundChain::StartWarpSyncRequest {
+                    target,
+                    begin_hash,
+                    timeout,
+                    result,
+                },
+            ) => {
                 match task
                     .network
                     .start_grandpa_warp_sync_request(&target, chain_id, begin_hash, timeout)
@@ -1109,16 +1333,16 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                         let _ = result.send(Err(WarpSyncRequestError::NoConnection));
                     }
                 }
-
-                continue;
             }
-            WhatHappened::Message(ToBackground::StartStorageProofRequest {
+            WakeUpReason::MessageForChain(
                 chain_id,
-                target,
-                config,
-                timeout,
-                result,
-            }) => {
+                ToBackgroundChain::StartStorageProofRequest {
+                    target,
+                    config,
+                    timeout,
+                    result,
+                },
+            ) => {
                 match task.network.start_storage_proof_request(
                     &target,
                     chain_id,
@@ -1143,16 +1367,16 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                         let _ = result.send(Err(StorageProofRequestError::RequestTooLarge));
                     }
                 };
-
-                continue;
             }
-            WhatHappened::Message(ToBackground::StartCallProofRequest {
+            WakeUpReason::MessageForChain(
                 chain_id,
-                target,
-                config,
-                timeout,
-                result,
-            }) => {
+                ToBackgroundChain::StartCallProofRequest {
+                    target,
+                    config,
+                    timeout,
+                    result,
+                },
+            ) => {
                 match task.network.start_call_proof_request(
                     &target,
                     chain_id,
@@ -1178,22 +1402,21 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                         let _ = result.send(Err(CallProofRequestError::RequestTooLarge));
                     }
                 };
-
-                continue;
             }
-            WhatHappened::Message(ToBackground::SetLocalBestBlock {
+            WakeUpReason::MessageForChain(
                 chain_id,
-                best_hash,
-                best_number,
-            }) => {
+                ToBackgroundChain::SetLocalBestBlock {
+                    best_hash,
+                    best_number,
+                },
+            ) => {
                 task.network
                     .set_chain_local_best_block(chain_id, best_hash, best_number);
-                continue;
             }
-            WhatHappened::Message(ToBackground::SetLocalGrandpaState {
+            WakeUpReason::MessageForChain(
                 chain_id,
-                grandpa_state,
-            }) => {
+                ToBackgroundChain::SetLocalGrandpaState { grandpa_state },
+            ) => {
                 log::debug!(
                     target: "network",
                     "Chain({}) <= SetLocalGrandpaState(set_id: {}, commit_finalized_height: {})",
@@ -1206,56 +1429,73 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
 
                 task.network
                     .gossip_broadcast_grandpa_state_and_update(chain_id, grandpa_state);
-                continue;
             }
-            WhatHappened::Message(ToBackground::AnnounceTransaction {
+            WakeUpReason::MessageForChain(
                 chain_id,
-                transaction,
-                result,
-            }) => {
-                let mut sent_peers = Vec::with_capacity(16); // TODO: capacity?
-
+                ToBackgroundChain::AnnounceTransaction {
+                    transaction,
+                    result,
+                },
+            ) => {
                 // TODO: keep track of which peer knows about which transaction, and don't send it again
 
-                // TODO: collecting in a Vec :-/
-                for peer in task
+                let peers_to_send = task
                     .network
                     .gossip_connected_peers(chain_id, service::GossipKind::ConsensusTransactions)
                     .cloned()
-                    .collect::<Vec<_>>()
-                {
-                    if task
+                    .collect::<Vec<_>>();
+
+                let mut peers_sent = Vec::with_capacity(peers_to_send.len());
+                let mut peers_queue_full = Vec::with_capacity(peers_to_send.len());
+                for peer in &peers_to_send {
+                    match task
                         .network
                         .gossip_send_transaction(&peer, chain_id, &transaction)
-                        .is_ok()
                     {
-                        sent_peers.push(peer);
-                    };
+                        Ok(()) => peers_sent.push(peer.to_base58()),
+                        Err(QueueNotificationError::QueueFull) => {
+                            peers_queue_full.push(peer.to_base58())
+                        }
+                        Err(QueueNotificationError::NoConnection) => unreachable!(),
+                    }
                 }
 
-                let _ = result.send(sent_peers);
-                continue;
+                log::debug!(
+                    target: "network",
+                    "Chain({}) <= AnnounceTransaction(hash={}, len={}, peers_sent={}, peers_queue_full={})",
+                    task.network[chain_id].log_name,
+                    hex::encode(blake2_rfc::blake2b::blake2b(32, &[], &transaction).as_bytes()),
+                    transaction.len(),
+                    peers_sent.join(", "),
+                    peers_queue_full.join(", "),
+                );
+
+                let _ = result.send(peers_to_send);
             }
-            WhatHappened::Message(ToBackground::SendBlockAnnounce {
-                target,
+            WakeUpReason::MessageForChain(
                 chain_id,
-                scale_encoded_header,
-                is_best,
-                result,
-            }) => {
+                ToBackgroundChain::SendBlockAnnounce {
+                    target,
+                    scale_encoded_header,
+                    is_best,
+                    result,
+                },
+            ) => {
+                // TODO: log who the announce was sent to
                 let _ = result.send(task.network.gossip_send_block_announce(
                     &target,
                     chain_id,
                     &scale_encoded_header,
                     is_best,
                 ));
-                continue;
             }
-            WhatHappened::Message(ToBackground::Discover {
+            WakeUpReason::MessageForChain(
                 chain_id,
-                list,
-                important_nodes,
-            }) => {
+                ToBackgroundChain::Discover {
+                    list,
+                    important_nodes,
+                },
+            ) => {
                 for (peer_id, addrs) in list {
                     if important_nodes {
                         task.important_nodes.insert(peer_id.clone());
@@ -1267,15 +1507,17 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                         .insert_chain_peer(chain_id, peer_id.clone(), 30); // TODO: constant
 
                     for addr in addrs {
-                        let _ = task
-                            .peering_strategy
-                            .insert_address(&peer_id, addr.into_vec(), 10); // TODO: constant
+                        let _ =
+                            task.peering_strategy
+                                .insert_address(&peer_id, addr.into_bytes(), 10);
+                        // TODO: constant
                     }
                 }
-
-                continue;
             }
-            WhatHappened::Message(ToBackground::DiscoveredNodes { chain_id, result }) => {
+            WakeUpReason::MessageForChain(
+                chain_id,
+                ToBackgroundChain::DiscoveredNodes { result },
+            ) => {
                 // TODO: consider returning Vec<u8>s for the addresses?
                 let _ = result.send(
                     task.peering_strategy
@@ -1284,15 +1526,14 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                             let addrs = task
                                 .peering_strategy
                                 .peer_addresses(peer_id)
-                                .map(|a| Multiaddr::try_from(a.to_owned()).unwrap())
+                                .map(|a| Multiaddr::from_bytes(a.to_owned()).unwrap())
                                 .collect::<Vec<_>>();
                             (peer_id.clone(), addrs)
                         })
                         .collect::<Vec<_>>(),
                 );
-                continue;
             }
-            WhatHappened::Message(ToBackground::PeersList { chain_id, result }) => {
+            WakeUpReason::MessageForChain(chain_id, ToBackgroundChain::PeersList { result }) => {
                 let _ = result.send(
                     task.network
                         .gossip_connected_peers(
@@ -1302,9 +1543,8 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                         .cloned()
                         .collect(),
                 );
-                continue;
             }
-            WhatHappened::Message(ToBackground::StartDiscovery) => {
+            WakeUpReason::StartDiscovery => {
                 for chain_id in task.network.chains().collect::<Vec<_>>() {
                     let random_peer_id = {
                         let mut pub_key = [0; 32];
@@ -1336,85 +1576,153 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                             Err(service::StartRequestError::NoConnection) => unreachable!(),
                         };
 
+                        log::debug!(
+                            target: "network",
+                            "Discovery({}) => FindNode(request_target={}, requested_peer_id={})",
+                            &task.network[chain_id].log_name,
+                            target,
+                            random_peer_id
+                        );
+
                         let _prev_value = task
                             .kademlia_find_node_requests
                             .insert(substream_id, chain_id);
                         debug_assert!(_prev_value.is_none());
                     } else {
-                        // TODO: log message
+                        log::debug!(
+                            target: "network",
+                            "Discovery({}) => NoPeer",
+                            &task.network[chain_id].log_name
+                        );
                     }
                 }
-
-                continue;
             }
-            WhatHappened::NetworkEvent(service::Event::HandshakeFinished {
+            WakeUpReason::NetworkEvent(service::Event::HandshakeFinished {
                 peer_id,
                 expected_peer_id,
                 id,
             }) => {
                 let remote_addr =
-                    Multiaddr::try_from(task.network.connection_remote_addr(id).to_owned())
-                        .unwrap(); // TODO: review this unwrap
+                    Multiaddr::from_bytes(task.network.connection_remote_addr(id)).unwrap(); // TODO: review this unwrap
                 if let Some(expected_peer_id) = expected_peer_id.as_ref().filter(|p| **p != peer_id)
                 {
                     log::debug!(target: "network", "Connections({}, {}) => HandshakePeerIdMismatch(actual={})", expected_peer_id, remote_addr, peer_id);
 
-                    task.peering_strategy
-                        .remove_address(expected_peer_id, remote_addr.as_ref());
-                    let _ = task.peering_strategy.insert_or_set_connected_address(
+                    let _was_in = task
+                        .peering_strategy
+                        .decrease_address_connections_and_remove_if_zero(
+                            expected_peer_id,
+                            remote_addr.as_ref(),
+                        );
+                    debug_assert!(_was_in.is_ok());
+                    let _ = task.peering_strategy.increase_address_connections(
                         &peer_id,
-                        remote_addr.clone().into_vec(),
+                        remote_addr.into_bytes().to_vec(),
                         10,
                     );
                 } else {
                     log::debug!(target: "network", "Connections({}, {}) => HandshakeFinished", peer_id, remote_addr);
                 }
-                continue;
             }
-            WhatHappened::NetworkEvent(service::Event::PreHandshakeDisconnected {
-                address,
-                expected_peer_id,
+            WakeUpReason::NetworkEvent(service::Event::PreHandshakeDisconnected {
+                expected_peer_id: Some(_),
+                ..
+            })
+            | WakeUpReason::NetworkEvent(service::Event::Disconnected { .. }) => {
+                let (address, peer_id, handshake_finished) = match wake_up_reason {
+                    WakeUpReason::NetworkEvent(service::Event::PreHandshakeDisconnected {
+                        address,
+                        expected_peer_id: Some(peer_id),
+                        ..
+                    }) => (address, peer_id, false),
+                    WakeUpReason::NetworkEvent(service::Event::Disconnected {
+                        address,
+                        peer_id,
+                        ..
+                    }) => (address, peer_id, true),
+                    _ => unreachable!(),
+                };
+
+                task.peering_strategy
+                    .decrease_address_connections(&peer_id, &address)
+                    .unwrap();
+                let address = Multiaddr::from_bytes(address).unwrap();
+                log::debug!(target: "network", "Connections({}, {}) => Shutdown(handshake_finished={handshake_finished:?})", peer_id, address);
+
+                // Ban the peer in order to avoid trying over and over again the same address(es).
+                // Even if the handshake was finished, it is possible that the peer simply shuts
+                // down connections immediately after it has been opened, hence the ban.
+                // Due to race conditions and peerid mismatches, it is possible that there is
+                // another existing connection or connection attempt with that same peer. However,
+                // it is not possible to be sure that we will reach 0 connections or connection
+                // attempts, and thus we ban the peer every time.
+                let ban_duration = Duration::from_secs(5);
+                task.network.gossip_remove_desired_all(
+                    &peer_id,
+                    service::GossipKind::ConsensusTransactions,
+                );
+                for (&chain_id, what_happened) in task
+                    .peering_strategy
+                    .unassign_slots_and_ban(&peer_id, task.platform.now() + ban_duration)
+                {
+                    if matches!(
+                        what_happened,
+                        basic_peering_strategy::UnassignSlotsAndBan::Banned { had_slot: true }
+                    ) {
+                        log::debug!(
+                            target: "network",
+                            "Slots({}) ∌ {} (reason=pre-handshake-disconnect, ban-duration={:?})",
+                            &task.network[chain_id].log_name,
+                            peer_id,
+                            ban_duration
+                        );
+                    }
+                }
+            }
+            WakeUpReason::NetworkEvent(service::Event::PreHandshakeDisconnected {
+                expected_peer_id: None,
                 ..
             }) => {
-                if let Some(expected_peer_id) = expected_peer_id {
-                    task.peering_strategy
-                        .disconnect_addr(&expected_peer_id, &address)
-                        .unwrap();
-                    let address = Multiaddr::try_from(address).unwrap();
-                    log::debug!(target: "network", "Connections({}, {}) => Shutdown(handshake_finished=false)", expected_peer_id, address);
-                }
-                continue;
+                // This path can't be reached as we always set an expected peer id when creating
+                // a connection.
+                debug_assert!(false);
             }
-            WhatHappened::NetworkEvent(service::Event::Disconnected {
-                address, peer_id, ..
-            }) => {
-                task.peering_strategy
-                    .disconnect_addr(&peer_id, &address)
-                    .unwrap();
-                let address = Multiaddr::try_from(address).unwrap();
-                log::debug!(target: "network", "Connections({}, {}) => Shutdown(handshake_finished=true)", peer_id, address);
-                continue;
-            }
-            WhatHappened::NetworkEvent(service::Event::BlockAnnounce {
+            WakeUpReason::NetworkEvent(service::Event::BlockAnnounce {
                 chain_id,
                 peer_id,
                 announce,
             }) => {
                 log::debug!(
                     target: "network",
-                    "Connection({}, {}) => BlockAnnounce(best_hash={}, is_best={})",
-                    peer_id,
+                    "Gossip({}, {}) => BlockAnnounce(best_hash={}, is_best={})",
                     &task.network[chain_id].log_name,
+                    peer_id,
                     HashDisplay(&header::hash_from_scale_encoded_header(announce.decode().scale_encoded_header)),
                     announce.decode().is_best
                 );
-                Event::BlockAnnounce {
-                    chain_id,
-                    peer_id,
-                    announce,
+
+                let decoded_announce = announce.decode();
+                if decoded_announce.is_best {
+                    let link = task
+                        .open_gossip_links
+                        .get_mut(&(chain_id, peer_id.clone()))
+                        .unwrap();
+                    if let Ok(decoded) = header::decode(
+                        &decoded_announce.scale_encoded_header,
+                        task.network[chain_id].block_number_bytes,
+                    ) {
+                        link.best_block_hash = header::hash_from_scale_encoded_header(
+                            &decoded_announce.scale_encoded_header,
+                        );
+                        link.best_block_number = decoded.number;
+                    }
                 }
+
+                debug_assert!(task.event_pending_send.is_none());
+                task.event_pending_send =
+                    Some((chain_id, Event::BlockAnnounce { peer_id, announce }));
             }
-            WhatHappened::NetworkEvent(service::Event::GossipConnected {
+            WakeUpReason::NetworkEvent(service::Event::GossipConnected {
                 peer_id,
                 chain_id,
                 role,
@@ -1425,20 +1733,35 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                 log::debug!(
                     target: "network",
                     "Gossip({}, {}) => Opened(best_height={}, best_hash={})",
-                    peer_id,
                     &task.network[chain_id].log_name,
+                    peer_id,
                     best_number,
                     HashDisplay(&best_hash)
                 );
-                Event::Connected {
-                    peer_id,
+
+                let _prev_value = task.open_gossip_links.insert(
+                    (chain_id, peer_id.clone()),
+                    OpenGossipLinkState {
+                        best_block_number: best_number,
+                        best_block_hash: best_hash,
+                        role,
+                        finalized_block_height: None,
+                    },
+                );
+                debug_assert!(_prev_value.is_none());
+
+                debug_assert!(task.event_pending_send.is_none());
+                task.event_pending_send = Some((
                     chain_id,
-                    role,
-                    best_block_number: best_number,
-                    best_block_hash: best_hash,
-                }
+                    Event::Connected {
+                        peer_id,
+                        role,
+                        best_block_number: best_number,
+                        best_block_hash: best_hash,
+                    },
+                ));
             }
-            WhatHappened::NetworkEvent(service::Event::GossipOpenFailed {
+            WakeUpReason::NetworkEvent(service::Event::GossipOpenFailed {
                 peer_id,
                 chain_id,
                 error,
@@ -1450,63 +1773,86 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     &task.network[chain_id].log_name,
                     peer_id, error,
                 );
-                log::debug!(
-                    target: "connections",
-                    "{}Slots ∌ {}", // TODO:
-                    &task.network[chain_id].log_name,
-                    peer_id
-                );
+                let ban_duration = Duration::from_secs(15);
+
                 // Note that peer doesn't necessarily have an out slot, as this event might happen
                 // as a result of an inbound gossip connection.
-                task.network.gossip_remove_desired(
-                    chain_id,
-                    &peer_id,
-                    service::GossipKind::ConsensusTransactions,
-                );
-                if let service::GossipConnectError::GenesisMismatch { .. } = error {
-                    task.peering_strategy
-                        .unassign_slot_and_remove_chain_peer(&chain_id, &peer_id);
+                let had_slot = if let service::GossipConnectError::GenesisMismatch { .. } = error {
+                    matches!(
+                        task.peering_strategy
+                            .unassign_slot_and_remove_chain_peer(&chain_id, &peer_id),
+                        basic_peering_strategy::UnassignSlotAndRemoveChainPeer::HadSlot
+                    )
                 } else {
-                    task.peering_strategy.unassign_slot_and_ban(
-                        &chain_id,
+                    matches!(
+                        task.peering_strategy.unassign_slot_and_ban(
+                            &chain_id,
+                            &peer_id,
+                            task.platform.now() + ban_duration,
+                        ),
+                        basic_peering_strategy::UnassignSlotAndBan::Banned { had_slot: true }
+                    )
+                };
+
+                if had_slot {
+                    log::debug!(
+                        target: "network",
+                        "Slots({}) ∌ {} (reason=gossip-open-failed, ban-duration={:?})",
+                        &task.network[chain_id].log_name,
+                        peer_id,
+                        ban_duration
+                    );
+                    task.network.gossip_remove_desired(
+                        chain_id,
                         &peer_id,
-                        task.platform.now() + Duration::from_secs(15),
+                        service::GossipKind::ConsensusTransactions,
                     );
                 }
-                continue;
             }
-            WhatHappened::NetworkEvent(service::Event::GossipDisconnected {
+            WakeUpReason::NetworkEvent(service::Event::GossipDisconnected {
                 peer_id,
                 chain_id,
                 kind: service::GossipKind::ConsensusTransactions,
             }) => {
                 log::debug!(
                     target: "network",
-                    "Connection({}, {}) => GossipDisconnected",
+                    "Gossip({}, {}) => Closed",
+                    &task.network[chain_id].log_name,
                     peer_id,
-                    &task.network[chain_id].log_name,
                 );
-                log::debug!(
-                    target: "connections",
-                    "{}Slots ∌ {}", // TODO:
-                    &task.network[chain_id].log_name,
-                    peer_id
-                );
+                let ban_duration = Duration::from_secs(10);
+
+                let _was_in = task.open_gossip_links.remove(&(chain_id, peer_id.clone()));
+                debug_assert!(_was_in.is_some());
+
                 // Note that peer doesn't necessarily have an out slot, as this event might happen
                 // as a result of an inbound gossip connection.
-                task.peering_strategy.unassign_slot_and_ban(
-                    &chain_id,
-                    &peer_id,
-                    task.platform.now() + Duration::from_secs(10),
-                );
-                task.network.gossip_remove_desired(
-                    chain_id,
-                    &peer_id,
-                    service::GossipKind::ConsensusTransactions,
-                );
-                Event::Disconnected { peer_id, chain_id }
+                if matches!(
+                    task.peering_strategy.unassign_slot_and_ban(
+                        &chain_id,
+                        &peer_id,
+                        task.platform.now() + ban_duration,
+                    ),
+                    basic_peering_strategy::UnassignSlotAndBan::Banned { had_slot: true }
+                ) {
+                    log::debug!(
+                        target: "network",
+                        "Slots({}) ∌ {} (reason=gossip-closed, ban-duration={:?})",
+                        &task.network[chain_id].log_name,
+                        peer_id,
+                        ban_duration
+                    );
+                    task.network.gossip_remove_desired(
+                        chain_id,
+                        &peer_id,
+                        service::GossipKind::ConsensusTransactions,
+                    );
+                }
+
+                debug_assert!(task.event_pending_send.is_none());
+                task.event_pending_send = Some((chain_id, Event::Disconnected { peer_id }));
             }
-            WhatHappened::NetworkEvent(service::Event::RequestResult {
+            WakeUpReason::NetworkEvent(service::Event::RequestResult {
                 substream_id,
                 response: service::RequestResult::Blocks(response),
             }) => {
@@ -1515,9 +1861,8 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     .remove(&substream_id)
                     .unwrap()
                     .send(response.map_err(BlocksRequestError::Request));
-                continue;
             }
-            WhatHappened::NetworkEvent(service::Event::RequestResult {
+            WakeUpReason::NetworkEvent(service::Event::RequestResult {
                 substream_id,
                 response: service::RequestResult::GrandpaWarpSync(response),
             }) => {
@@ -1526,9 +1871,8 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     .remove(&substream_id)
                     .unwrap()
                     .send(response.map_err(WarpSyncRequestError::Request));
-                continue;
             }
-            WhatHappened::NetworkEvent(service::Event::RequestResult {
+            WakeUpReason::NetworkEvent(service::Event::RequestResult {
                 substream_id,
                 response: service::RequestResult::StorageProof(response),
             }) => {
@@ -1537,9 +1881,8 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     .remove(&substream_id)
                     .unwrap()
                     .send(response.map_err(StorageProofRequestError::Request));
-                continue;
             }
-            WhatHappened::NetworkEvent(service::Event::RequestResult {
+            WakeUpReason::NetworkEvent(service::Event::RequestResult {
                 substream_id,
                 response: service::RequestResult::CallProof(response),
             }) => {
@@ -1548,9 +1891,8 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     .remove(&substream_id)
                     .unwrap()
                     .send(response.map_err(CallProofRequestError::Request));
-                continue;
             }
-            WhatHappened::NetworkEvent(service::Event::RequestResult {
+            WakeUpReason::NetworkEvent(service::Event::RequestResult {
                 substream_id,
                 response: service::RequestResult::KademliaFindNode(Ok(nodes)),
             }) => {
@@ -1559,24 +1901,43 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     .remove(&substream_id)
                     .unwrap();
 
-                log::debug!(
-                    target: "connections", "On chain {}, discovered: {}",
-                    &task.network[chain_id].log_name,
-                    nodes.iter().map(|(p, _)| p.to_string()).join(", ")
-                );
+                for (peer_id, mut addrs) in nodes {
+                    // Make sure to not insert too many address for a single peer.
+                    // While the .
+                    if addrs.len() >= 10 {
+                        addrs.truncate(10);
+                    }
 
-                for (peer_id, addrs) in nodes {
                     let mut valid_addrs = Vec::with_capacity(addrs.len());
                     for addr in addrs {
-                        match Multiaddr::try_from(addr) {
-                            Ok(a) => valid_addrs.push(a),
-                            Err(err) => {
+                        match Multiaddr::from_bytes(addr) {
+                            Ok(a) => {
+                                if platform::address_parse::multiaddr_to_address(&a)
+                                    .ok()
+                                    .map_or(false, |addr| {
+                                        task.platform.supports_connection_type((&addr).into())
+                                    })
+                                {
+                                    valid_addrs.push(a)
+                                } else {
+                                    log::debug!(
+                                        target: "network",
+                                        "Discovery({}) => UnsupportedAddress(peer_id={}, addr={})",
+                                        &task.network[chain_id].log_name,
+                                        peer_id,
+                                        &a
+                                    );
+                                }
+                            }
+                            Err((err, addr)) => {
                                 log::debug!(
-                                    target: "connections",
-                                    "Discovery => InvalidAddress({})",
-                                    hex::encode(&err.addr)
+                                    target: "network",
+                                    "Discovery({}) => InvalidAddress(peer_id={}, error={}, addr={})",
+                                    &task.network[chain_id].log_name,
+                                    peer_id,
+                                    err,
+                                    hex::encode(&addr)
                                 );
-                                continue;
                             }
                         }
                     }
@@ -1584,24 +1945,43 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     if !valid_addrs.is_empty() {
                         // Note that we must call this function before `insert_address`,
                         // as documented in `basic_peering_strategy`.
-                        task.peering_strategy
-                            .insert_chain_peer(chain_id, peer_id.clone(), 30); // TODO: constant
+                        let insert_outcome =
+                            task.peering_strategy
+                                .insert_chain_peer(chain_id, peer_id.clone(), 30); // TODO: constant
+
+                        if let basic_peering_strategy::InsertChainPeerResult::Inserted {
+                            peer_removed,
+                        } = insert_outcome
+                        {
+                            if let Some(peer_removed) = peer_removed {
+                                log::debug!(
+                                    target: "network", "Discovery({}) => PeerPurged(peer_id={})",
+                                    &task.network[chain_id].log_name,
+                                    peer_removed,
+                                );
+                            }
+
+                            log::debug!(
+                                target: "network", "Discovery({}) => NewPeer(peer_id={}, addr={})",
+                                &task.network[chain_id].log_name,
+                                peer_id,
+                                valid_addrs.iter().map(|a| a.to_string()).join(", addr=")
+                            );
+                        }
                     }
 
                     for addr in valid_addrs {
                         let _insert_result =
                             task.peering_strategy
-                                .insert_address(&peer_id, addr.into_vec(), 10); // TODO: constant
+                                .insert_address(&peer_id, addr.into_bytes(), 10); // TODO: constant
                         debug_assert!(!matches!(
                             _insert_result,
                             basic_peering_strategy::InsertAddressResult::UnknownPeer
                         ));
                     }
                 }
-
-                continue;
             }
-            WhatHappened::NetworkEvent(service::Event::RequestResult {
+            WakeUpReason::NetworkEvent(service::Event::RequestResult {
                 substream_id,
                 response: service::RequestResult::KademliaFindNode(Err(error)),
             }) => {
@@ -1611,8 +1991,8 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     .unwrap();
 
                 log::debug!(
-                    target: "connections",
-                    "Discovery({}) => {:?}",
+                    target: "network",
+                    "Discovery({}) => FindNodeError(error={:?})",
                     &task.network[chain_id].log_name,
                     error
                 );
@@ -1630,7 +2010,7 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     ) => {
                         // TODO: remove this warning in a long time
                         log::warn!(
-                            target: "connections",
+                            target: "network",
                             "Problem during discovery on {}: protocol not available. \
                             This might indicate that the version of Substrate used by \
                             the chain doesn't include \
@@ -1640,21 +2020,19 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     }
                     _ => {
                         log::warn!(
-                            target: "connections",
+                            target: "network",
                             "Problem during discovery on {}: {}",
                             &task.network[chain_id].log_name,
                             error
                         );
                     }
                 }
-
-                continue;
             }
-            WhatHappened::NetworkEvent(service::Event::RequestResult { .. }) => {
+            WakeUpReason::NetworkEvent(service::Event::RequestResult { .. }) => {
                 // We never start any other kind of requests.
                 unreachable!()
             }
-            WhatHappened::NetworkEvent(service::Event::GossipInDesired {
+            WakeUpReason::NetworkEvent(service::Event::GossipInDesired {
                 peer_id,
                 chain_id,
                 kind: service::GossipKind::ConsensusTransactions,
@@ -1670,10 +2048,10 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     < 4
                 {
                     log::debug!(
-                        target: "connections",
-                        "InSlots({}) ∋ {}",
+                        target: "network",
+                        "Gossip({}, {}) => GossipInDesired(outcome=accepted)",
                         &task.network[chain_id].log_name,
-                        peer_id
+                        peer_id,
                     );
                     task.network
                         .gossip_open(
@@ -1684,10 +2062,10 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                         .unwrap();
                 } else {
                     log::debug!(
-                        target: "connections",
-                        "Connections({}) => GossipInDesiredRejected(chain={}, error=full)",
-                        peer_id,
+                        target: "network",
+                        "Gossip({}, {}) => GossipInDesired(outcome=rejected)",
                         &task.network[chain_id].log_name,
+                        peer_id,
                     );
                     task.network
                         .gossip_close(
@@ -1697,14 +2075,12 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                         )
                         .unwrap();
                 }
-
-                continue;
             }
-            WhatHappened::NetworkEvent(service::Event::GossipInDesiredCancel { .. }) => {
+            WakeUpReason::NetworkEvent(service::Event::GossipInDesiredCancel { .. }) => {
                 // Can't happen as we already instantaneously accept or reject gossip in requests.
                 unreachable!()
             }
-            WhatHappened::NetworkEvent(service::Event::IdentifyRequestIn {
+            WakeUpReason::NetworkEvent(service::Event::IdentifyRequestIn {
                 peer_id,
                 substream_id,
             }) => {
@@ -1715,14 +2091,13 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                 );
                 task.network
                     .respond_identify(substream_id, &task.identify_agent_version);
-                continue;
             }
-            WhatHappened::NetworkEvent(service::Event::BlocksRequestIn { .. }) => unreachable!(),
-            WhatHappened::NetworkEvent(service::Event::RequestInCancel { .. }) => {
+            WakeUpReason::NetworkEvent(service::Event::BlocksRequestIn { .. }) => unreachable!(),
+            WakeUpReason::NetworkEvent(service::Event::RequestInCancel { .. }) => {
                 // All incoming requests are immediately answered.
                 unreachable!()
             }
-            WhatHappened::NetworkEvent(service::Event::GrandpaNeighborPacket {
+            WakeUpReason::NetworkEvent(service::Event::GrandpaNeighborPacket {
                 chain_id,
                 peer_id,
                 state,
@@ -1730,19 +2105,28 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                 log::debug!(
                     target: "network",
                     "Gossip({}, {}) => GrandpaNeighborPacket(round_number={}, set_id={}, commit_finalized_height={})",
-                    peer_id,
                     &task.network[chain_id].log_name,
+                    peer_id,
                     state.round_number,
                     state.set_id,
                     state.commit_finalized_height,
                 );
-                Event::GrandpaNeighborPacket {
+
+                task.open_gossip_links
+                    .get_mut(&(chain_id, peer_id.clone()))
+                    .unwrap()
+                    .finalized_block_height = Some(state.commit_finalized_height);
+
+                debug_assert!(task.event_pending_send.is_none());
+                task.event_pending_send = Some((
                     chain_id,
-                    peer_id,
-                    finalized_block_height: state.commit_finalized_height,
-                }
+                    Event::GrandpaNeighborPacket {
+                        peer_id,
+                        finalized_block_height: state.commit_finalized_height,
+                    },
+                ));
             }
-            WhatHappened::NetworkEvent(service::Event::GrandpaCommitMessage {
+            WakeUpReason::NetworkEvent(service::Event::GrandpaCommitMessage {
                 chain_id,
                 peer_id,
                 message,
@@ -1750,17 +2134,16 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                 log::debug!(
                     target: "network",
                     "Gossip({}, {}) => GrandpaCommitMessage(target_block_hash={})",
-                    peer_id,
                     &task.network[chain_id].log_name,
-                    HashDisplay(message.decode().message.target_hash),
-                );
-                Event::GrandpaCommitMessage {
-                    chain_id,
                     peer_id,
-                    message,
-                }
+                    HashDisplay(message.decode().target_hash),
+                );
+
+                debug_assert!(task.event_pending_send.is_none());
+                task.event_pending_send =
+                    Some((chain_id, Event::GrandpaCommitMessage { peer_id, message }));
             }
-            WhatHappened::NetworkEvent(service::Event::ProtocolError { peer_id, error }) => {
+            WakeUpReason::NetworkEvent(service::Event::ProtocolError { peer_id, error }) => {
                 // TODO: handle properly?
                 log::warn!(
                     target: "network",
@@ -1770,14 +2153,13 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                 );
 
                 // TODO: disconnect peer
-                continue;
             }
-            WhatHappened::CanAssignSlot(peer_id, chain_id) => {
+            WakeUpReason::CanAssignSlot(peer_id, chain_id) => {
                 task.peering_strategy.assign_slot(&chain_id, &peer_id);
 
                 log::debug!(
-                    target: "connections",
-                    "OutSlots({}) ∋ {}",
+                    target: "network",
+                    "Slots({}) ∋ {}",
                     &task.network[chain_id].log_name,
                     peer_id
                 );
@@ -1787,31 +2169,53 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     peer_id,
                     service::GossipKind::ConsensusTransactions,
                 );
-
-                continue;
             }
-            WhatHappened::CanStartConnect(peer_id) => {
-                // TODO: restore rate limiting
-
-                let Some(multiaddr) = task.peering_strategy.addr_to_connected(&peer_id) else {
+            WakeUpReason::NextRecentConnectionRestore => {
+                task.num_recent_connection_opening =
+                    task.num_recent_connection_opening.saturating_sub(1);
+            }
+            WakeUpReason::CanStartConnect(expected_peer_id) => {
+                let Some(multiaddr) = task
+                    .peering_strategy
+                    .pick_address_and_add_connection(&expected_peer_id)
+                else {
                     // There is no address for that peer in the address book.
                     task.network.gossip_remove_desired_all(
-                        &peer_id,
+                        &expected_peer_id,
                         service::GossipKind::ConsensusTransactions,
                     );
-                    task.peering_strategy.unassign_slots_and_ban(
-                        &peer_id,
-                        task.platform.now() + Duration::from_secs(10),
-                    );
+                    let ban_duration = Duration::from_secs(10);
+                    for (&chain_id, what_happened) in task.peering_strategy.unassign_slots_and_ban(
+                        &expected_peer_id,
+                        task.platform.now() + ban_duration,
+                    ) {
+                        if matches!(
+                            what_happened,
+                            basic_peering_strategy::UnassignSlotsAndBan::Banned { had_slot: true }
+                        ) {
+                            log::debug!(
+                                target: "network",
+                                "Slots({}) ∌ {} (reason=no-address, ban-duration={:?})",
+                                &task.network[chain_id].log_name,
+                                expected_peer_id,
+                                ban_duration
+                            );
+                        }
+                    }
                     continue;
                 };
 
-                let multiaddr = match multiaddr::Multiaddr::try_from(multiaddr.to_owned()) {
+                let multiaddr = match multiaddr::Multiaddr::from_bytes(multiaddr.to_owned()) {
                     Ok(a) => a,
-                    Err(multiaddr::FromVecError { addr }) => {
+                    Err((multiaddr::FromBytesError, addr)) => {
                         // Address is in an invalid format.
-                        let _was_in = task.peering_strategy.remove_address(&peer_id, &addr);
-                        debug_assert!(_was_in);
+                        let _was_in = task
+                            .peering_strategy
+                            .decrease_address_connections_and_remove_if_zero(
+                                &expected_peer_id,
+                                &addr,
+                            );
+                        debug_assert!(_was_in.is_ok());
                         continue;
                     }
                 };
@@ -1833,8 +2237,11 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     // Address is in an invalid format or isn't supported by the platform.
                     let _was_in = task
                         .peering_strategy
-                        .remove_address(&peer_id, multiaddr.as_ref());
-                    debug_assert!(_was_in);
+                        .decrease_address_connections_and_remove_if_zero(
+                            &expected_peer_id,
+                            multiaddr.as_ref(),
+                        );
+                    debug_assert!(_was_in.is_ok());
                     continue;
                 };
 
@@ -1848,18 +2255,20 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                 };
 
                 log::debug!(
-                    target: "connections",
+                    target: "network",
                     "Connections({}) <= StartConnecting(remote_addr={}, local_peer_id={})",
-                    peer_id,
+                    expected_peer_id,
                     multiaddr,
                     peer_id::PublicKey::Ed25519(*noise_key.libp2p_public_ed25519_key()).into_peer_id(),
                 );
 
+                task.num_recent_connection_opening += 1;
+
                 let (coordinator_to_connection_tx, coordinator_to_connection_rx) =
                     async_channel::bounded(8);
-                let task_name = format!("connection-{}-{}", peer_id, multiaddr);
+                let task_name = format!("connection-{}", multiaddr);
 
-                let connection_id = match address {
+                match address {
                     address_parse::AddressOrMultiStreamAddress::Address(address) => {
                         // As documented in the `PlatformRef` trait, `connect_stream` must
                         // return as soon as possible.
@@ -1872,8 +2281,9 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                                     is_initiator: true,
                                     noise_key: &noise_key,
                                 },
-                                multiaddr.clone().into_vec(),
-                                Some(peer_id.clone()),
+                                multiaddr.clone().into_bytes(),
+                                Some(expected_peer_id.clone()),
+                                coordinator_to_connection_tx,
                             );
 
                         task.platform.spawn_task(
@@ -1885,11 +2295,9 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                                 connection_id,
                                 connection_task,
                                 coordinator_to_connection_rx,
-                                task.messages_tx.clone(),
+                                task.tasks_messages_tx.clone(),
                             ),
                         );
-
-                        connection_id
                     }
                     address_parse::AddressOrMultiStreamAddress::MultiStreamAddress(
                         platform::MultiStreamAddress::WebRtc {
@@ -1912,11 +2320,11 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                             .await;
 
                         // Convert the SHA256 hashes into multihashes.
-                        let local_tls_certificate_multihash = [12u8, 32]
+                        let local_tls_certificate_multihash = [18u8, 32]
                             .into_iter()
                             .chain(connection.local_tls_certificate_sha256.into_iter())
                             .collect();
-                        let remote_tls_certificate_multihash = [12u8, 32]
+                        let remote_tls_certificate_multihash = [18u8, 32]
                             .into_iter()
                             .chain(remote_certificate_sha256.into_iter())
                             .collect();
@@ -1930,8 +2338,9 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                                     remote_tls_certificate_multihash,
                                     noise_key: &noise_key,
                                 },
-                                multiaddr.clone().into_vec(),
-                                Some(peer_id.clone()),
+                                multiaddr.clone().into_bytes(),
+                                Some(expected_peer_id.clone()),
+                                coordinator_to_connection_tx,
                             );
 
                         task.platform.spawn_task(
@@ -1943,22 +2352,13 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                                 connection_id,
                                 connection_task,
                                 coordinator_to_connection_rx,
-                                task.messages_tx.clone(),
+                                task.tasks_messages_tx.clone(),
                             ),
                         );
-
-                        connection_id
                     }
-                };
-
-                let _prev_value = task
-                    .active_connections
-                    .insert(connection_id, coordinator_to_connection_tx);
-                debug_assert!(_prev_value.is_none());
-
-                continue;
+                }
             }
-            WhatHappened::CanOpenGossip(peer_id, chain_id) => {
+            WakeUpReason::CanOpenGossip(peer_id, chain_id) => {
                 task.network
                     .gossip_open(
                         chain_id,
@@ -1970,55 +2370,24 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                 log::debug!(
                     target: "network",
                     "Gossip({}, {}) <= Open",
-                    peer_id,
                     &task.network[chain_id].log_name,
+                    peer_id,
                 );
-
-                continue;
             }
-            WhatHappened::MessageToConnection {
+            WakeUpReason::MessageToConnection {
                 connection_id,
                 message,
             } => {
-                // Note that it is critical for the sending to not take too long here, in order to not
-                // block the process of the network service.
-                // In particular, if sending the message to the connection is blocked due to sending
-                // a message on the connection-to-coordinator channel, this will result in a deadlock.
-                // For this reason, the connection task is always ready to immediately accept a message
-                // on the coordinator-to-connection channel.
-                task.active_connections
-                    .get_mut(&connection_id)
-                    .unwrap()
-                    .send(message)
-                    .await
-                    .unwrap();
-                continue;
+                // Note that it is critical for the sending to not take too long here, in order to
+                // not block the process of the network service.
+                // In particular, if sending the message to the connection is blocked due to
+                // sending a message on the connection-to-coordinator channel, this will result
+                // in a deadlock.
+                // For this reason, the connection task is always ready to immediately accept a
+                // message on the coordinator-to-connection channel.
+                let _send_result = task.network[connection_id].send(message).await;
+                debug_assert!(_send_result.is_ok());
             }
-        };
-
-        // Dispatch the event to the various senders.
-
-        // We made sure that the senders were ready before generating an event.
-        let either::Left(event_senders) = &mut task.event_senders else {
-            unreachable!()
-        };
-
-        let mut event_senders = mem::take(event_senders);
-        task.event_senders = either::Right(Box::pin(async move {
-            // This little `if` avoids having to do `event.clone()` if we don't have to.
-            if event_senders.len() == 1 {
-                let _ = event_senders[0].send(event_to_dispatch).await;
-            } else {
-                for sender in event_senders.iter_mut() {
-                    // For simplicity we don't get rid of closed senders because senders
-                    // aren't supposed to close, and that leaving closed senders in the
-                    // list doesn't have any consequence other than one extra iteration
-                    // every time.
-                    let _ = sender.send(event_to_dispatch.clone()).await;
-                }
-            }
-
-            event_senders
-        }));
+        }
     }
 }

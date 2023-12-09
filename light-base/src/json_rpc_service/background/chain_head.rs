@@ -43,7 +43,7 @@ use smoldot::{
     executor::{self, runtime_host},
     header,
     json_rpc::{self, methods, service},
-    network::protocol,
+    network::codec,
 };
 
 impl<TPlat: PlatformRef> Background<TPlat> {
@@ -98,7 +98,7 @@ impl<TPlat: PlatformRef> Background<TPlat> {
                     "Rejected `chainHead_unstable_follow` subscription due to limit reached."
                 );
                 request.fail(json_rpc::parse::ErrorResponse::ApplicationDefined(
-                    -32100,
+                    -32800,
                     "Maximum number of `chainHead_unstable_follow` subscriptions reached",
                 ));
                 return;
@@ -114,7 +114,7 @@ impl<TPlat: PlatformRef> Background<TPlat> {
         let events = if with_runtime {
             let subscribe_all = self
                 .runtime_service
-                .subscribe_all("chainHead_follow", 32, NonZeroUsize::new(32).unwrap())
+                .subscribe_all(32, NonZeroUsize::new(32).unwrap())
                 .await;
             let id = subscribe_all.new_blocks.id();
             either::Left((subscribe_all, id))
@@ -554,7 +554,7 @@ impl<TPlat: PlatformRef> ChainHeadFollowTask<TPlat> {
         mut messages_rx: service::DeliverReceiver<service::RequestProcess>,
     ) {
         loop {
-            enum WhatHappened {
+            enum WakeUpReason {
                 SubscriptionDead,
                 NotificationWithRuntime(runtime_service::Notification),
                 NotificationWithoutRuntime(sync_service::Notification),
@@ -567,19 +567,19 @@ impl<TPlat: PlatformRef> ChainHeadFollowTask<TPlat> {
                 NewRequest(service::RequestProcess),
             }
 
-            let outcome: WhatHappened = {
+            let outcome: WakeUpReason = {
                 let next_block = async {
                     match &mut self.subscription {
                         Subscription::WithRuntime { notifications, .. } => {
                             match notifications.next().await {
-                                Some(n) => WhatHappened::NotificationWithRuntime(n),
-                                None => WhatHappened::SubscriptionDead,
+                                Some(n) => WakeUpReason::NotificationWithRuntime(n),
+                                None => WakeUpReason::SubscriptionDead,
                             }
                         }
                         Subscription::WithoutRuntime(notifications) => {
                             match notifications.next().await {
-                                Some(n) => WhatHappened::NotificationWithoutRuntime(n),
-                                None => WhatHappened::SubscriptionDead,
+                                Some(n) => WakeUpReason::NotificationWithoutRuntime(n),
+                                None => WakeUpReason::SubscriptionDead,
                             }
                         }
                     }
@@ -587,7 +587,7 @@ impl<TPlat: PlatformRef> ChainHeadFollowTask<TPlat> {
 
                 let operation_event = async {
                     let event = self.from_operation_handlers.next().await.unwrap();
-                    WhatHappened::OperationEvent {
+                    WakeUpReason::OperationEvent {
                         operation_id: event.operation_id,
                         notification: event.notification,
                         is_done: event.is_done,
@@ -596,8 +596,8 @@ impl<TPlat: PlatformRef> ChainHeadFollowTask<TPlat> {
 
                 let message = async {
                     match messages_rx.next().await {
-                        Some(rq) => WhatHappened::NewRequest(rq),
-                        None => WhatHappened::Unsubscribed,
+                        Some(rq) => WakeUpReason::NewRequest(rq),
+                        None => WakeUpReason::Unsubscribed,
                     }
                 };
 
@@ -606,15 +606,15 @@ impl<TPlat: PlatformRef> ChainHeadFollowTask<TPlat> {
                     .or(operation_event)
                     .or(async {
                         subscription.wait_until_stale().await;
-                        WhatHappened::Unsubscribed
+                        WakeUpReason::Unsubscribed
                     })
                     .await
             };
 
             // TODO: doesn't enforce any maximum number of pinned blocks
             match outcome {
-                WhatHappened::Unsubscribed => return,
-                WhatHappened::SubscriptionDead => {
+                WakeUpReason::Unsubscribed => return,
+                WakeUpReason::SubscriptionDead => {
                     subscription
                         .send_notification(
                             methods::ServerToClient::chainHead_unstable_followEvent {
@@ -626,7 +626,7 @@ impl<TPlat: PlatformRef> ChainHeadFollowTask<TPlat> {
                     break;
                 }
 
-                WhatHappened::OperationEvent {
+                WakeUpReason::OperationEvent {
                     operation_id,
                     notification,
                     is_done,
@@ -654,14 +654,14 @@ impl<TPlat: PlatformRef> ChainHeadFollowTask<TPlat> {
                     }
                 }
 
-                WhatHappened::NotificationWithRuntime(
+                WakeUpReason::NotificationWithRuntime(
                     runtime_service::Notification::Finalized {
                         best_block_hash,
                         hash,
                         ..
                     },
                 )
-                | WhatHappened::NotificationWithoutRuntime(
+                | WakeUpReason::NotificationWithoutRuntime(
                     sync_service::Notification::Finalized {
                         best_block_hash,
                         hash,
@@ -703,10 +703,10 @@ impl<TPlat: PlatformRef> ChainHeadFollowTask<TPlat> {
                         )
                         .await;
                 }
-                WhatHappened::NotificationWithoutRuntime(
+                WakeUpReason::NotificationWithoutRuntime(
                     sync_service::Notification::BestBlockChanged { hash },
                 )
-                | WhatHappened::NotificationWithRuntime(
+                | WakeUpReason::NotificationWithRuntime(
                     runtime_service::Notification::BestBlockChanged { hash },
                 ) => {
                     subscription
@@ -720,7 +720,7 @@ impl<TPlat: PlatformRef> ChainHeadFollowTask<TPlat> {
                         )
                         .await;
                 }
-                WhatHappened::NotificationWithRuntime(runtime_service::Notification::Block(
+                WakeUpReason::NotificationWithRuntime(runtime_service::Notification::Block(
                     block,
                 )) => {
                     let hash = header::hash_from_scale_encoded_header(&block.scale_encoded_header);
@@ -765,7 +765,7 @@ impl<TPlat: PlatformRef> ChainHeadFollowTask<TPlat> {
                             .await;
                     }
                 }
-                WhatHappened::NotificationWithoutRuntime(sync_service::Notification::Block(
+                WakeUpReason::NotificationWithoutRuntime(sync_service::Notification::Block(
                     block,
                 )) => {
                     let hash = header::hash_from_scale_encoded_header(&block.scale_encoded_header);
@@ -807,7 +807,7 @@ impl<TPlat: PlatformRef> ChainHeadFollowTask<TPlat> {
                             .await;
                     }
                 }
-                WhatHappened::NewRequest(rq) => self.on_foreground_message(rq).await,
+                WakeUpReason::NewRequest(rq) => self.on_foreground_message(rq).await,
             }
         }
     }
@@ -840,9 +840,9 @@ impl<TPlat: PlatformRef> ChainHeadFollowTask<TPlat> {
             }
             methods::MethodCall::chainHead_unstable_unpin {
                 follow_subscription: _,
-                hash,
+                hash_or_hashes,
             } => {
-                let all_hashes = match &hash {
+                let all_hashes = match &hash_or_hashes {
                     methods::HashHexStringSingleOrArray::Single(hash) => {
                         either::Left(iter::once(&hash.0))
                     }
@@ -863,7 +863,7 @@ impl<TPlat: PlatformRef> ChainHeadFollowTask<TPlat> {
                         } = self.subscription
                         {
                             self.runtime_service
-                                .unpin_block(subscription_id, hash)
+                                .unpin_block(subscription_id, *hash)
                                 .await;
                         }
                     }
@@ -939,7 +939,7 @@ impl<TPlat: PlatformRef> ChainHeadFollowTask<TPlat> {
                     let future = sync_service.clone().block_query(
                         block_number,
                         hash.0,
-                        protocol::BlocksRequestFields {
+                        codec::BlocksRequestFields {
                             header: true,
                             body: true,
                             justifications: false,
@@ -1292,7 +1292,7 @@ impl<TPlat: PlatformRef> ChainHeadFollowTask<TPlat> {
 
                 match self
                     .runtime_service
-                    .pinned_block_runtime_access(subscription_id, &hash.0)
+                    .pinned_block_runtime_access(subscription_id, hash.0)
                     .await
                 {
                     Ok(c) => c,

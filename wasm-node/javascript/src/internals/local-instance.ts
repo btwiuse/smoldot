@@ -69,7 +69,7 @@ export type Event =
     { ty: "connection-reset", connectionId: number } |
     { ty: "connection-stream-open", connectionId: number } |
     { ty: "connection-stream-reset", connectionId: number, streamId: number } |
-    { ty: "stream-send", connectionId: number, streamId?: number, data: Uint8Array } |
+    { ty: "stream-send", connectionId: number, streamId?: number, data: Array<Uint8Array> } |
     { ty: "stream-send-close", connectionId: number, streamId?: number };
 
 export type ParsedMultiaddr =
@@ -96,7 +96,7 @@ export interface Instance {
     streamWritableBytes: (connectionId: number, numExtra: number, streamId?: number) => void,
     streamMessage: (connectionId: number, message: Uint8Array, streamId?: number) => void,
     streamOpened: (connectionId: number, streamId: number, direction: 'inbound' | 'outbound') => void,
-    streamReset: (connectionId: number, streamId: number) => void,
+    streamReset: (connectionId: number, streamId: number, message: string) => void,
 }
 
 /**
@@ -355,11 +355,18 @@ export async function startLocalInstance(config: Config, wasmModule: WebAssembly
         // that this function is called only when the connection is in an open state.
         stream_send: (connectionId: number, streamId: number, ptr: number, len: number) => {
             const instance = state.instance!;
+            const mem = new Uint8Array(instance.exports.memory.buffer);
 
             ptr >>>= 0;
             len >>>= 0;
 
-            const data = new Uint8Array(instance.exports.memory.buffer).slice(ptr, ptr + len);
+            const data = new Array();
+            for (let i = 0; i < len; ++i) {
+                const bufPtr = buffer.readUInt32LE(mem, ptr + 8 * i);
+                const bufLen = buffer.readUInt32LE(mem, ptr + 8 * i + 4);
+                data.push(mem.slice(bufPtr, bufPtr + bufLen));
+            } 
+
             // TODO: docs says the streamId is provided only for multi-stream connections, but here it's always provided
             eventCallback({ ty: "stream-send", connectionId, streamId, data });
         },
@@ -594,10 +601,12 @@ export async function startLocalInstance(config: Config, wasmModule: WebAssembly
             );
         },
 
-        streamReset: (connectionId: number, streamId: number) => {
+        streamReset: (connectionId: number, streamId: number, message: string) => {
             if (!state.instance)
                 return;
-            state.instance.exports.stream_reset(connectionId, streamId);
+            state.bufferIndices[0] = new TextEncoder().encode(message);
+            state.instance.exports.stream_reset(connectionId, streamId, 0);
+            delete state.bufferIndices[0]
         },
     };
 }
@@ -626,7 +635,7 @@ interface SmoldotWasmExports extends WebAssembly.Exports {
     stream_message: (connectionId: number, streamId: number, bufferIndex: number) => void,
     connection_stream_opened: (connectionId: number, streamId: number, outbound: number) => void,
     connection_reset: (connectionId: number, bufferIndex: number) => void,
-    stream_reset: (connectionId: number, streamId: number) => void,
+    stream_reset: (connectionId: number, streamId: number, bufferIndex: number) => void,
 }
 
 interface SmoldotWasmInstance extends WebAssembly.Instance {

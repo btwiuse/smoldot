@@ -31,14 +31,13 @@ use crate::{network_service, platform::PlatformRef, runtime_service};
 use alloc::{borrow::ToOwned as _, boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::{cmp, fmt, future::Future, mem, num::NonZeroU32, pin::Pin, time::Duration};
 use futures_channel::oneshot;
-use futures_lite::stream;
 use rand::seq::IteratorRandom as _;
 use rand_chacha::rand_core::SeedableRng as _;
 use smoldot::{
     chain,
     executor::host,
     libp2p::PeerId,
-    network::{protocol, service},
+    network::{codec, service},
     trie::{self, prefix_proof, proof_decode, Nibble},
 };
 
@@ -61,15 +60,7 @@ pub struct Config<TPlat: PlatformRef> {
 
     /// Access to the network, and index of the chain to sync from the point of view of the
     /// network service.
-    pub network_service: (
-        Arc<network_service::NetworkService<TPlat>>,
-        network_service::ChainId,
-    ),
-
-    /// Receiver for events coming from the network, as returned by
-    /// [`network_service::NetworkService::new`].
-    pub network_events_receiver: Pin<Box<dyn stream::Stream<Item = network_service::Event> + Send>>,
-
+    pub network_service: Arc<network_service::NetworkServiceChain<TPlat>>,
     /// Extra fields depending on whether the chain is a relay chain or a parachain.
     pub chain_type: ConfigChainType<TPlat>,
 }
@@ -142,9 +133,7 @@ pub struct SyncService<TPlat: PlatformRef> {
     platform: TPlat,
 
     /// See [`Config::network_service`].
-    network_service: Arc<network_service::NetworkService<TPlat>>,
-    /// See [`Config::network_service`].
-    network_chain_id: network_service::ChainId,
+    network_service: Arc<network_service::NetworkServiceChain<TPlat>>,
     /// See [`Config::block_number_bytes`].
     block_number_bytes: usize,
 }
@@ -166,9 +155,7 @@ impl<TPlat: PlatformRef> SyncService<TPlat> {
                 config_parachain.relay_chain_block_number_bytes,
                 config_parachain.para_id,
                 from_foreground,
-                config.network_service.0.clone(),
-                config.network_service.1,
-                config.network_events_receiver,
+                config.network_service.clone(),
             )),
             ConfigChainType::RelayChain(config_relay_chain) => {
                 Box::pin(standalone::start_standalone_chain(
@@ -178,9 +165,7 @@ impl<TPlat: PlatformRef> SyncService<TPlat> {
                     config.block_number_bytes,
                     config_relay_chain.runtime_code_hint,
                     from_foreground,
-                    config.network_service.0.clone(),
-                    config.network_service.1,
-                    config.network_events_receiver,
+                    config.network_service.clone(),
                 ))
             }
         };
@@ -195,8 +180,7 @@ impl<TPlat: PlatformRef> SyncService<TPlat> {
         SyncService {
             to_background,
             platform: config.platform,
-            network_service: config.network_service.0,
-            network_chain_id: config.network_service.1,
+            network_service: config.network_service,
             block_number_bytes: config.block_number_bytes,
         }
     }
@@ -281,7 +265,7 @@ impl<TPlat: PlatformRef> SyncService<TPlat> {
     /// meaningful logic
     pub async fn syncing_peers(
         &self,
-    ) -> impl ExactSizeIterator<Item = (PeerId, protocol::Role, u64, [u8; 32])> {
+    ) -> impl ExactSizeIterator<Item = (PeerId, codec::Role, u64, [u8; 32])> {
         let (send_back, rx) = oneshot::channel();
 
         self.to_background
@@ -327,16 +311,16 @@ impl<TPlat: PlatformRef> SyncService<TPlat> {
         self: Arc<Self>,
         block_number: u64,
         hash: [u8; 32],
-        fields: protocol::BlocksRequestFields,
+        fields: codec::BlocksRequestFields,
         total_attempts: u32,
         timeout_per_request: Duration,
         _max_parallel: NonZeroU32,
-    ) -> Result<protocol::BlockData, ()> {
+    ) -> Result<codec::BlockData, ()> {
         // TODO: better error?
-        let request_config = protocol::BlocksRequestConfig {
-            start: protocol::BlocksRequestConfigStart::Hash(hash),
+        let request_config = codec::BlocksRequestConfig {
+            start: codec::BlocksRequestConfigStart::Hash(hash),
             desired_count: NonZeroU32::new(1).unwrap(),
-            direction: protocol::BlocksRequestDirection::Ascending,
+            direction: codec::BlocksRequestDirection::Ascending,
             fields: fields.clone(),
         };
 
@@ -350,16 +334,11 @@ impl<TPlat: PlatformRef> SyncService<TPlat> {
             let mut result = match self
                 .network_service
                 .clone()
-                .blocks_request(
-                    target,
-                    self.network_chain_id,
-                    request_config.clone(),
-                    timeout_per_request,
-                )
+                .blocks_request(target, request_config.clone(), timeout_per_request)
                 .await
             {
-                Ok(b) => b,
-                Err(_) => continue,
+                Ok(b) if !b.is_empty() => b,
+                Ok(_) | Err(_) => continue,
             };
 
             return Ok(result.remove(0));
@@ -372,16 +351,16 @@ impl<TPlat: PlatformRef> SyncService<TPlat> {
     pub async fn block_query_unknown_number(
         self: Arc<Self>,
         hash: [u8; 32],
-        fields: protocol::BlocksRequestFields,
+        fields: codec::BlocksRequestFields,
         total_attempts: u32,
         timeout_per_request: Duration,
         _max_parallel: NonZeroU32,
-    ) -> Result<protocol::BlockData, ()> {
+    ) -> Result<codec::BlockData, ()> {
         // TODO: better error?
-        let request_config = protocol::BlocksRequestConfig {
-            start: protocol::BlocksRequestConfigStart::Hash(hash),
+        let request_config = codec::BlocksRequestConfig {
+            start: codec::BlocksRequestConfigStart::Hash(hash),
             desired_count: NonZeroU32::new(1).unwrap(),
-            direction: protocol::BlocksRequestDirection::Ascending,
+            direction: codec::BlocksRequestDirection::Ascending,
             fields: fields.clone(),
         };
 
@@ -389,23 +368,18 @@ impl<TPlat: PlatformRef> SyncService<TPlat> {
         // TODO: better peers selection ; don't just take the first
         for target in self
             .network_service
-            .peers_list(self.network_chain_id)
+            .peers_list()
             .await
             .take(usize::try_from(total_attempts).unwrap_or(usize::max_value()))
         {
             let mut result = match self
                 .network_service
                 .clone()
-                .blocks_request(
-                    target,
-                    self.network_chain_id,
-                    request_config.clone(),
-                    timeout_per_request,
-                )
+                .blocks_request(target, request_config.clone(), timeout_per_request)
                 .await
             {
-                Ok(b) => b,
-                Err(_) => continue,
+                Ok(b) if !b.is_empty() => b,
+                Ok(_) | Err(_) => continue,
             };
 
             if result.is_empty() {
@@ -583,9 +557,8 @@ impl<TPlat: PlatformRef> SyncService<TPlat> {
                 .network_service
                 .clone()
                 .storage_proof_request(
-                    self.network_chain_id,
                     target,
-                    protocol::StorageProofRequestConfig {
+                    codec::StorageProofRequestConfig {
                         block_hash: *block_hash,
                         keys: keys_to_request.into_iter(),
                     },
@@ -809,10 +782,7 @@ impl<TPlat: PlatformRef> SyncService<TPlat> {
     pub async fn call_proof_query(
         self: Arc<Self>,
         block_number: u64,
-        config: protocol::CallProofRequestConfig<
-            '_,
-            impl Iterator<Item = impl AsRef<[u8]>> + Clone,
-        >,
+        config: codec::CallProofRequestConfig<'_, impl Iterator<Item = impl AsRef<[u8]>> + Clone>,
         total_attempts: u32,
         timeout_per_request: Duration,
         _max_parallel: NonZeroU32,
@@ -830,12 +800,7 @@ impl<TPlat: PlatformRef> SyncService<TPlat> {
             let result = self
                 .network_service
                 .clone()
-                .call_proof_request(
-                    self.network_chain_id,
-                    target,
-                    config.clone(),
-                    timeout_per_request,
-                )
+                .call_proof_request(target, config.clone(), timeout_per_request)
                 .await;
 
             match result {
@@ -1182,7 +1147,7 @@ enum ToBackground {
     },
     /// See [`SyncService::syncing_peers`].
     SyncingPeers {
-        send_back: oneshot::Sender<Vec<(PeerId, protocol::Role, u64, [u8; 32])>>,
+        send_back: oneshot::Sender<Vec<(PeerId, codec::Role, u64, [u8; 32])>>,
     },
     /// See [`SyncService::serialize_chain_information`].
     SerializeChainInformation {

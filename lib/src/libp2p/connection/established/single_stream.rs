@@ -138,9 +138,7 @@ where
             if self.inner.yamux.has_substream(self.inner.outgoing_pings) {
                 let mut payload = [0u8; 32];
                 self.inner.ping_payload_randomness.fill_bytes(&mut payload);
-                self.inner
-                    .yamux
-                    .user_data_mut(self.inner.outgoing_pings)
+                self.inner.yamux[self.inner.outgoing_pings]
                     .as_mut()
                     .unwrap()
                     .0
@@ -425,6 +423,13 @@ where
             .unwrap()
     }
 
+    /// Modifies the value that was initially passed through [`Config::max_protocol_name_len`].
+    ///
+    /// The new value only applies to substreams opened after this function has been called.
+    pub fn set_max_protocol_name_len(&mut self, new_value: usize) {
+        self.inner.max_protocol_name_len = new_value;
+    }
+
     /// Sends a request to the remote.
     ///
     /// This method only inserts the request into the connection object. Use
@@ -536,12 +541,7 @@ where
             _ => panic!(),
         };
 
-        let (substream, ud) = self
-            .inner
-            .yamux
-            .user_data_mut(substream_id)
-            .as_mut()
-            .unwrap();
+        let (substream, ud) = self.inner.yamux[substream_id].as_mut().unwrap();
         substream.accept_inbound(ty);
         debug_assert!(ud.is_none());
         *ud = Some(user_data);
@@ -561,12 +561,7 @@ where
             _ => panic!(),
         };
 
-        let (substream, ud) = self
-            .inner
-            .yamux
-            .user_data_mut(substream_id)
-            .as_mut()
-            .unwrap();
+        let (substream, ud) = self.inner.yamux[substream_id].as_mut().unwrap();
         substream.reject_inbound();
         debug_assert!(ud.is_none());
         self.inner.yamux.mark_substream_write_ready(substream_id);
@@ -590,9 +585,7 @@ where
             _ => panic!(),
         };
 
-        self.inner
-            .yamux
-            .user_data_mut(substream_id)
+        self.inner.yamux[substream_id]
             .as_mut()
             .unwrap()
             .0
@@ -613,9 +606,7 @@ where
             _ => panic!(),
         };
 
-        self.inner
-            .yamux
-            .user_data_mut(substream_id)
+        self.inner.yamux[substream_id]
             .as_mut()
             .unwrap()
             .0
@@ -650,9 +641,7 @@ where
             _ => panic!(),
         };
 
-        self.inner
-            .yamux
-            .user_data_mut(substream_id)
+        self.inner.yamux[substream_id]
             .as_mut()
             .unwrap()
             .0
@@ -681,9 +670,7 @@ where
         // data that Noise and Yamux have extracted is always bounded anyway. It's not worth the
         // effort of reporting a 100% accurate information when a 100% accurate information isn't
         // needed.
-        self.inner
-            .yamux
-            .user_data(substream_id)
+        self.inner.yamux[substream_id]
             .as_ref()
             .unwrap()
             .0
@@ -691,18 +678,17 @@ where
     }
 
     /// Closes a notifications substream opened after a successful
-    /// [`Event::NotificationsOutResult`] or that was accepted using
-    /// [`SingleStream::accept_in_notifications_substream`].
+    /// [`Event::NotificationsOutResult`].
     ///
-    /// In the case of an outbound substream, this can be done even when in the negotiation phase,
-    /// in other words before the remote has accepted/refused the substream.
+    /// This can be done even when in the negotiation phase, in other words before the remote has
+    /// accepted/refused the substream.
     ///
     /// # Panic
     ///
     /// Panics if the [`SubstreamId`] doesn't correspond to a notifications substream, or if the
     /// notifications substream isn't in the appropriate state.
     ///
-    pub fn close_notifications_substream(&mut self, substream_id: SubstreamId) {
+    pub fn close_out_notifications_substream(&mut self, substream_id: SubstreamId) {
         let substream_id = match substream_id.0 {
             SubstreamIdInner::SingleStream(id) => id,
             _ => panic!(),
@@ -712,13 +698,37 @@ where
             panic!()
         }
 
-        self.inner
-            .yamux
-            .user_data_mut(substream_id)
+        self.inner.yamux[substream_id]
             .as_mut()
             .unwrap()
             .0
-            .close_notifications_substream();
+            .close_out_notifications_substream();
+        self.inner.yamux.mark_substream_write_ready(substream_id);
+    }
+
+    /// Closes a notifications substream that was accepted using
+    /// [`SingleStream::accept_in_notifications_substream`].
+    ///
+    /// # Panic
+    ///
+    /// Panics if the [`SubstreamId`] doesn't correspond to a notifications substream, or if the
+    /// notifications substream isn't in the appropriate state.
+    ///
+    pub fn close_in_notifications_substream(&mut self, substream_id: SubstreamId, timeout: TNow) {
+        let substream_id = match substream_id.0 {
+            SubstreamIdInner::SingleStream(id) => id,
+            _ => panic!(),
+        };
+
+        if !self.inner.yamux.has_substream(substream_id) {
+            panic!()
+        }
+
+        self.inner.yamux[substream_id]
+            .as_mut()
+            .unwrap()
+            .0
+            .close_in_notifications_substream(timeout);
         self.inner.yamux.mark_substream_write_ready(substream_id);
     }
 
@@ -742,9 +752,7 @@ where
             return Err(RespondInRequestError::SubstreamClosed);
         }
 
-        self.inner
-            .yamux
-            .user_data_mut(substream_id)
+        self.inner.yamux[substream_id]
             .as_mut()
             .unwrap()
             .0
@@ -763,9 +771,7 @@ impl<TNow, TSubUd> Index<SubstreamId> for SingleStream<TNow, TSubUd> {
             _ => panic!(),
         };
 
-        self.inner
-            .yamux
-            .user_data(substream_id)
+        self.inner.yamux[substream_id]
             .as_ref()
             .unwrap()
             .1
@@ -781,9 +787,7 @@ impl<TNow, TSubUd> IndexMut<SubstreamId> for SingleStream<TNow, TSubUd> {
             _ => panic!(),
         };
 
-        self.inner
-            .yamux
-            .user_data_mut(substream_id)
+        self.inner.yamux[substream_id]
             .as_mut()
             .unwrap()
             .1

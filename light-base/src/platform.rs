@@ -16,7 +16,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use alloc::borrow::Cow;
-use core::{fmt, future::Future, ops, pin::Pin, str, time::Duration};
+use core::{fmt, future::Future, ops, panic::UnwindSafe, pin::Pin, str, time::Duration};
 use futures_util::future;
 
 pub use smoldot::libp2p::read_write;
@@ -38,7 +38,7 @@ pub use default::DefaultPlatform;
 /// Implementations of this trait are expected to be cheaply-clonable "handles". All clones of the
 /// same platform share the same objects. For instance, it is legal to create clone a platform,
 /// then create a connection on one clone, then access this connection on the other clone.
-pub trait PlatformRef: Clone + Send + Sync + 'static {
+pub trait PlatformRef: UnwindSafe + Clone + Send + Sync + 'static {
     /// `Future` that resolves once a certain amount of time has passed or a certain point in time
     /// is reached. See [`PlatformRef::sleep`] and [`PlatformRef::sleep_until`].
     type Delay: Future<Output = ()> + Send + 'static;
@@ -131,6 +131,17 @@ pub trait PlatformRef: Clone + Send + Sync + 'static {
     /// The first parameter is the name of the task, which can be useful for debugging purposes.
     ///
     /// The `Future` must be run until it yields a value.
+    ///
+    /// Implementers should be aware of the fact that polling the `Future` might panic (never
+    /// intentionally, but in case of a bug). Many tasks can be restarted if they panic, and
+    /// implementers are encouraged to absorb the panics that happen when polling. If a panic
+    /// happens, the `Future` that has panicked must never be polled again.
+    ///
+    /// > **Note**: Ideally, the `task` parameter would require the `UnwindSafe` trait.
+    /// >           Unfortunately, at the time of writing of this comment, it is extremely
+    /// >           difficult if not impossible to implement this trait on `Future`s. It is for
+    /// >           the same reason that the `std::thread::spawn` function of the standard library
+    /// >           doesn't require its parameter to implement `UnwindSafe`.
     fn spawn_task(
         &self,
         task_name: Cow<str>,
@@ -238,6 +249,9 @@ pub trait PlatformRef: Clone + Send + Sync + 'static {
 
     /// Returns a future that becomes ready when [`PlatformRef::read_write_access`] should be
     /// called again on this stream.
+    ///
+    /// Must always returned immediately if [`PlatformRef::read_write_access`] has never been
+    /// called on this stream.
     ///
     /// See the documentation of [`read_write`] for more information.
     ///

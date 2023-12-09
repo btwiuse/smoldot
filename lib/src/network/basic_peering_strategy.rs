@@ -39,12 +39,12 @@
 //!
 //! Each network identity that is associated with at least one chain is associated with zero or
 //! more addresses. It is not possible to insert addresses to peers that aren't associated to at
-//! least one chain. Each address is either "connected" or "disconnected".
+//! least one chain. The number of active connections of each address is also tracked.
 //!
 //! There exists a limit to the number of peers per chain and the number of addresses per peer,
 //! guaranteeing that the data structure only uses a bounded amount of memory. If these limits
-//! are reached, peers and addresses are removed randomly. Peers that have a slot and addresses
-//! in the "connected" state are never removed.
+//! are reached, peers and addresses are removed randomly. Peers that have a slot and at least one
+//! connected address are never removed.
 //!
 
 use crate::util;
@@ -70,9 +70,9 @@ pub struct BasicPeeringStrategy<TChainId, TInstant> {
     /// Contains all the keys of [`BasicPeeringStrategy::peer_ids`] indexed differently.
     peer_ids_indices: hashbrown::HashMap<PeerId, usize, util::SipHasherBuild>,
 
-    /// List of all known addresses, indexed by `peer_id_index`. The addresses are not intended
-    /// to be in a particular order.
-    addresses: BTreeMap<(usize, Vec<u8>), AddressState>,
+    /// List of all known addresses, indexed by `peer_id_index`, with the number of connections to
+    /// each address. The addresses are not intended to be in a particular order.
+    addresses: BTreeMap<(usize, Vec<u8>), u32>,
 
     /// List of all chains throughout the collection.
     ///
@@ -96,12 +96,6 @@ pub struct BasicPeeringStrategy<TChainId, TInstant> {
 
     /// Random number generator used to select peers to assign slots to and remove addresses/peers.
     randomness: ChaCha20Rng,
-}
-
-#[derive(Debug)]
-enum AddressState {
-    Connected,
-    Disconnected,
 }
 
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
@@ -158,6 +152,39 @@ where
             peers_chains: BTreeMap::new(),
             peers_chains_by_state: BTreeSet::new(),
             randomness,
+        }
+    }
+
+    /// Removes all the chain assignments for the given chain.
+    ///
+    /// If a peer isn't assigned to any chain anymore and doesn't have any connected address,
+    /// all of its addresses are also removed from the collection.
+    pub fn remove_chain_peers(&mut self, chain: &TChainId) {
+        let Some(chain_index) = self.chains_indices.remove(chain) else {
+            // Chain didn't exist.
+            return;
+        };
+        self.chains.remove(chain_index);
+
+        let chain_peers = {
+            let mut in_chain_and_after_chain = self.peers_chains_by_state.split_off(&(
+                chain_index,
+                PeerChainState::Assignable,
+                usize::min_value(),
+            ));
+            let mut after_chain = in_chain_and_after_chain.split_off(&(
+                chain_index + 1,
+                PeerChainState::Assignable,
+                usize::min_value(),
+            ));
+            self.peers_chains_by_state.append(&mut after_chain);
+            in_chain_and_after_chain
+        };
+
+        for (_, _, peer_id_index) in chain_peers {
+            let _was_in = self.peers_chains.remove(&(peer_id_index, chain_index));
+            debug_assert!(_was_in.is_some());
+            self.try_clean_up_peer_id(peer_id_index);
         }
     }
 
@@ -240,27 +267,43 @@ where
     ///
     /// Has no effect if the peer-chain association didn't exist.
     ///
-    /// If the peer isn't assigned to any chain anymore, all of its addresses are also removed
-    /// from the collection.
-    pub fn unassign_slot_and_remove_chain_peer(&mut self, chain: &TChainId, peer_id: &PeerId) {
+    /// If the peer isn't assigned to any chain anymore and doesn't have any connected address,
+    /// all of its addresses are also removed from the collection.
+    pub fn unassign_slot_and_remove_chain_peer(
+        &mut self,
+        chain: &TChainId,
+        peer_id: &PeerId,
+    ) -> UnassignSlotAndRemoveChainPeer<TInstant> {
         let Some(&peer_id_index) = self.peer_ids_indices.get(peer_id) else {
             // If the `PeerId` is unknown, it means it wasn't assigned in the first place.
-            return;
+            return UnassignSlotAndRemoveChainPeer::NotAssigned;
         };
 
         let Some(&chain_index) = self.chains_indices.get(chain) else {
             // If the `TChainId` is unknown, it means the peer wasn't assigned in the first place.
-            return;
+            return UnassignSlotAndRemoveChainPeer::NotAssigned;
         };
 
         if let Some(state) = self.peers_chains.remove(&(peer_id_index, chain_index)) {
             let _was_removed =
                 self.peers_chains_by_state
-                    .remove(&(chain_index, state, peer_id_index));
+                    .remove(&(chain_index, state.clone(), peer_id_index));
             debug_assert!(_was_removed);
 
             self.try_clean_up_peer_id(peer_id_index);
             self.try_clean_up_chain(chain_index);
+
+            match state {
+                PeerChainState::Assignable => UnassignSlotAndRemoveChainPeer::Assigned {
+                    ban_expiration: None,
+                },
+                PeerChainState::Banned { expires } => UnassignSlotAndRemoveChainPeer::Assigned {
+                    ban_expiration: Some(expires),
+                },
+                PeerChainState::Slot => UnassignSlotAndRemoveChainPeer::HadSlot,
+            }
+        } else {
+            UnassignSlotAndRemoveChainPeer::NotAssigned
         }
     }
 
@@ -289,67 +332,69 @@ where
 
     /// Inserts a new address for the given peer.
     ///
+    /// If the address wasn't known yet, its number of connections is set to zero.
+    ///
     /// If the peer doesn't belong to any chain (see [`BasicPeeringStrategy::insert_chain_peer`]),
-    /// then this function has no effect. This is to avoid accidentally collecting addresses for
-    /// peers that will never be removed and create a memory leak. For this reason, you most likely
-    /// want to call [`BasicPeeringStrategy::insert_chain_peer`] before calling this function.
+    /// then this function has no effect, unless the peer has at least one connected address. This
+    /// is to avoid accidentally collecting addresses for peers that will never be removed and
+    /// create a memory leak. For this reason, you most likely want to call
+    /// [`BasicPeeringStrategy::insert_chain_peer`] before calling this function.
     ///
     /// A maximum number of addresses that are maintained for this peer must be passed as
-    /// parameter. If this number is exceeded, an address in the "not connected" state (other than
+    /// parameter. If this number is exceeded, an address with zero connections (other than
     /// the one passed as parameter) is randomly removed.
-    ///
-    /// If an address is inserted, it is in the "not connected" state.
     pub fn insert_address(
         &mut self,
         peer_id: &PeerId,
         address: Vec<u8>,
         max_addresses: usize,
     ) -> InsertAddressResult {
-        self.insert_address_inner(
-            peer_id,
-            address,
-            max_addresses,
-            AddressState::Disconnected,
-            false,
-        )
-    }
-
-    /// Similar to [`BasicPeeringStrategy::insert_address`], except that the address, if it is
-    /// inserted, is directly in the "connected" state. If the address is already known, switches
-    /// it to the "connected" state.
-    ///
-    /// > **Note**: Use this function if you establish a connection and accidentally reach a
-    /// >           certain [`PeerId`].
-    pub fn insert_or_set_connected_address(
-        &mut self,
-        peer_id: &PeerId,
-        address: Vec<u8>,
-        max_addresses: usize,
-    ) -> InsertAddressResult {
-        self.insert_address_inner(
-            peer_id,
-            address,
-            max_addresses,
-            AddressState::Connected,
-            true,
-        )
-    }
-
-    fn insert_address_inner(
-        &mut self,
-        peer_id: &PeerId,
-        address: Vec<u8>,
-        max_addresses: usize,
-        initial_state: AddressState,
-        update_if_present: bool,
-    ) -> InsertAddressResult {
         let Some(&peer_id_index) = self.peer_ids_indices.get(peer_id) else {
             return InsertAddressResult::UnknownPeer;
         };
 
+        match self.insert_address_inner(peer_id_index, address, max_addresses, 0, false) {
+            InsertAddressConnectionsResult::AlreadyKnown => InsertAddressResult::AlreadyKnown,
+            InsertAddressConnectionsResult::Inserted { address_removed } => {
+                InsertAddressResult::Inserted { address_removed }
+            }
+        }
+    }
+
+    /// Increases the number of connections of the given address. If the address isn't known, it
+    /// is inserted.
+    ///
+    /// Contrary to [`BasicPeeringStrategy::insert_address`], the address is inserted anyway if
+    /// the `PeerId` isn't known.
+    ///
+    /// > **Note**: Use this function if you establish a connection and accidentally reach a
+    /// >           certain [`PeerId`].
+    ///
+    /// # Panic
+    ///
+    /// Panics if the number of connections is equal to `u32::max_value()`.
+    ///
+    pub fn increase_address_connections(
+        &mut self,
+        peer_id: &PeerId,
+        address: Vec<u8>,
+        max_addresses: usize,
+    ) -> InsertAddressConnectionsResult {
+        let peer_id_index = self.get_or_insert_peer_index(peer_id);
+        self.insert_address_inner(peer_id_index, address, max_addresses, 1, true)
+    }
+
+    fn insert_address_inner(
+        &mut self,
+        peer_id_index: usize,
+        address: Vec<u8>,
+        max_addresses: usize,
+        initial_num_connections: u32,
+        increase_if_present: bool,
+    ) -> InsertAddressConnectionsResult {
         match self.addresses.entry((peer_id_index, address.clone())) {
             btree_map::Entry::Vacant(entry) => {
-                entry.insert(initial_state);
+                entry.insert(initial_num_connections);
 
                 let address_removed = {
                     let num_addresses = self
@@ -361,9 +406,7 @@ where
                         // TODO: is it a good idea to choose the address randomly to remove? maybe there should be a sorting system with best addresses first?
                         self.addresses
                             .range((peer_id_index, Vec::new())..=(peer_id_index + 1, Vec::new()))
-                            .filter(|((_, a), s)| {
-                                matches!(s, AddressState::Disconnected) && *a != address
-                            })
+                            .filter(|((_, a), n)| **n == 0 && *a != address)
                             .choose(&mut self.randomness)
                             .map(|((_, a), _)| a.clone())
                     } else {
@@ -376,38 +419,18 @@ where
                         .remove(&(peer_id_index, address_removed.clone()));
                 }
 
-                InsertAddressResult::Inserted { address_removed }
+                InsertAddressConnectionsResult::Inserted { address_removed }
             }
             btree_map::Entry::Occupied(entry) => {
-                if update_if_present {
-                    *entry.into_mut() = initial_state;
+                let entry = entry.into_mut();
+                if increase_if_present {
+                    *entry = entry
+                        .checked_add(1)
+                        .unwrap_or_else(|| panic!("overflow in number of connections"));
                 }
 
-                InsertAddressResult::Duplicate
+                InsertAddressConnectionsResult::AlreadyKnown
             }
-        }
-    }
-
-    /// Removes an address.
-    ///
-    /// Works on both "not connected" and "connected" addresses.
-    ///
-    /// Returns `true` if an address was removed, or `false` if the address wasn't known.
-    pub fn remove_address(&mut self, peer_id: &PeerId, address: &[u8]) -> bool {
-        let Some(&peer_id_index) = self.peer_ids_indices.get(peer_id) else {
-            // If the `PeerId` is unknown, it means it doesn't have an address anyway.
-            return false;
-        };
-
-        if self
-            .addresses
-            .remove(&(peer_id_index, address.to_owned()))
-            .is_some()
-        {
-            self.try_clean_up_peer_id(peer_id_index);
-            true
-        } else {
-            false
         }
     }
 
@@ -525,24 +548,37 @@ where
     /// Has no effect if the peer isn't assigned to the given chain.
     ///
     /// If the peer was already banned, the new ban expiration is `max(existing_ban, when_unban)`.
+    ///
+    /// Returns what this function did.
     pub fn unassign_slot_and_ban(
         &mut self,
         chain: &TChainId,
         peer_id: &PeerId,
         when_unban: TInstant,
-    ) {
+    ) -> UnassignSlotAndBan<TInstant> {
         let (Some(&peer_id_index), Some(&chain_index)) = (
             self.peer_ids_indices.get(peer_id),
             self.chains_indices.get(chain),
         ) else {
-            return;
+            return UnassignSlotAndBan::NotAssigned;
         };
 
         if let Some(state) = self.peers_chains.get_mut(&(peer_id_index, chain_index)) {
-            if matches!(state, PeerChainState::Banned { expires } if *expires >= when_unban) {
-                // Ban is already long enough. Nothing to do.
-                return;
-            }
+            let return_value = match state {
+                PeerChainState::Banned { expires } if *expires >= when_unban => {
+                    // Ban is already long enough. Nothing to do.
+                    return UnassignSlotAndBan::AlreadyBanned {
+                        when_unban: expires.clone(),
+                        ban_extended: false,
+                    };
+                }
+                PeerChainState::Banned { .. } => UnassignSlotAndBan::AlreadyBanned {
+                    when_unban: when_unban.clone(),
+                    ban_extended: true,
+                },
+                PeerChainState::Assignable => UnassignSlotAndBan::Banned { had_slot: false },
+                PeerChainState::Slot => UnassignSlotAndBan::Banned { had_slot: true },
+            };
 
             let _was_in =
                 self.peers_chains_by_state
@@ -557,6 +593,10 @@ where
                 self.peers_chains_by_state
                     .insert((chain_index, state.clone(), peer_id_index));
             debug_assert!(_was_inserted);
+
+            return_value
+        } else {
+            UnassignSlotAndBan::NotAssigned
         }
     }
 
@@ -568,83 +608,119 @@ where
     ///
     /// If the peer was already banned, the new ban expiration is `max(existing_ban, when_unban)`.
     ///
+    /// Returns an iterator to the list of chains where the peer is now banned, and the details
+    /// of what has happened.
+    ///
     /// > **Note**: This function is a shortcut for calling
     /// >           [`BasicPeeringStrategy::unassign_slot_and_ban`] for all existing chains.
-    pub fn unassign_slots_and_ban(&mut self, peer_id: &PeerId, when_unban: TInstant) {
+    pub fn unassign_slots_and_ban(
+        &mut self,
+        peer_id: &PeerId,
+        when_unban: TInstant,
+    ) -> UnassignSlotsAndBanIter<TChainId, TInstant> {
         let Some(&peer_id_index) = self.peer_ids_indices.get(peer_id) else {
-            return;
+            return UnassignSlotsAndBanIter {
+                chains: &self.chains,
+                peers_chains_by_state: &mut self.peers_chains_by_state,
+                inner_iter: None,
+                peer_id_index: 0,
+                when_unban,
+            };
         };
 
-        for ((_, chain_index), state) in self
-            .peers_chains
-            .range_mut((peer_id_index, usize::min_value())..=(peer_id_index, usize::max_value()))
-        {
-            if matches!(state, PeerChainState::Banned { expires } if *expires >= when_unban) {
-                // Ban is already long enough. Nothing to do.
-                continue;
-            }
-
-            let _was_in =
-                self.peers_chains_by_state
-                    .remove(&(*chain_index, state.clone(), peer_id_index));
-            debug_assert!(_was_in);
-
-            *state = PeerChainState::Banned {
-                expires: when_unban.clone(),
-            };
-
-            let _was_inserted =
-                self.peers_chains_by_state
-                    .insert((*chain_index, state.clone(), peer_id_index));
-            debug_assert!(_was_inserted);
+        UnassignSlotsAndBanIter {
+            chains: &self.chains,
+            peers_chains_by_state: &mut self.peers_chains_by_state,
+            inner_iter: Some(
+                self.peers_chains
+                    .range_mut(
+                        (peer_id_index, usize::min_value())..=(peer_id_index, usize::max_value()),
+                    )
+                    .fuse(),
+            ),
+            peer_id_index,
+            when_unban,
         }
     }
 
-    /// Picks an address from the list whose state is "not connected", and switches it to
-    /// "connected". Returns `None` if no such address is available.
-    pub fn addr_to_connected(&mut self, peer_id: &PeerId) -> Option<&[u8]> {
+    /// Picks an address from the list with zero connections, and sets the number of connections
+    /// to one. Returns `None` if no such address is available.
+    pub fn pick_address_and_add_connection(&mut self, peer_id: &PeerId) -> Option<&[u8]> {
         let Some(&peer_id_index) = self.peer_ids_indices.get(peer_id) else {
             // If the `PeerId` is unknown, it means it doesn't have any address.
             return None;
         };
 
         // TODO: could be optimized further by removing filter() and adjusting the set
-        if let Some(((_, address), state)) = self
+        if let Some(((_, address), num_connections)) = self
             .addresses
             .range_mut((peer_id_index, Vec::new())..(peer_id_index + 1, Vec::new()))
-            .filter(|(_, state)| matches!(state, AddressState::Disconnected))
+            .filter(|(_, num_connections)| **num_connections == 0)
             .choose(&mut self.randomness)
         {
-            *state = AddressState::Connected;
+            *num_connections = 1;
             return Some(address);
         }
 
         None
     }
 
-    /// Marks the given address as "disconnected".
+    /// Removes one connection from the given address.
     ///
-    /// Has no effect if the address isn't known to the data structure, or if it was not in the
-    /// "connected" state.
-    pub fn disconnect_addr(
+    /// Returns an error if the address isn't known to the data structure, or if there was no
+    /// connection.
+    pub fn decrease_address_connections(
         &mut self,
         peer_id: &PeerId,
         address: &[u8],
-    ) -> Result<(), DisconnectAddrError> {
+    ) -> Result<(), DecreaseAddressConnectionsError> {
+        self.decrease_address_connections_inner(peer_id, address, false)
+    }
+
+    /// Removes one connection from the given address. If this decreases the number of connections
+    /// from one to zero, the address is removed entirely.
+    ///
+    /// Returns an error if the address isn't known to the data structure, or if there was no
+    /// connection.
+    pub fn decrease_address_connections_and_remove_if_zero(
+        &mut self,
+        peer_id: &PeerId,
+        address: &[u8],
+    ) -> Result<(), DecreaseAddressConnectionsError> {
+        self.decrease_address_connections_inner(peer_id, address, true)
+    }
+
+    fn decrease_address_connections_inner(
+        &mut self,
+        peer_id: &PeerId,
+        address: &[u8],
+        remove_if_reaches_zero: bool,
+    ) -> Result<(), DecreaseAddressConnectionsError> {
         let Some(&peer_id_index) = self.peer_ids_indices.get(peer_id) else {
             // If the `PeerId` is unknown, it means it doesn't have any address.
-            return Err(DisconnectAddrError::UnknownAddress);
+            return Err(DecreaseAddressConnectionsError::UnknownAddress);
         };
 
-        let Some(addr) = self.addresses.get_mut(&(peer_id_index, address.to_owned())) else {
-            return Err(DisconnectAddrError::UnknownAddress);
+        let Some(num_connections) = self.addresses.get_mut(&(peer_id_index, address.to_owned()))
+        else {
+            return Err(DecreaseAddressConnectionsError::UnknownAddress);
         };
 
-        match addr {
-            s @ AddressState::Connected => *s = AddressState::Disconnected,
-            AddressState::Disconnected => return Err(DisconnectAddrError::NotConnected),
+        if *num_connections == 0 {
+            return Err(DecreaseAddressConnectionsError::NotConnected);
         }
 
+        *num_connections -= 1;
+
+        if *num_connections != 0 {
+            return Ok(());
+        }
+
+        if remove_if_reaches_zero {
+            self.addresses.remove(&(peer_id_index, address.to_owned()));
+        }
+
+        self.try_clean_up_peer_id(peer_id_index);
         Ok(())
     }
 
@@ -711,6 +787,14 @@ where
             return;
         }
 
+        if self
+            .addresses
+            .range((peer_id_index, Vec::new())..(peer_id_index + 1, Vec::new()))
+            .any(|(_, num_connections)| *num_connections >= 1)
+        {
+            return;
+        }
+
         // PeerId is unused. We can remove it.
         let peer_id = self.peer_ids.remove(peer_id_index);
         let _was_in = self.peer_ids_indices.remove(&peer_id);
@@ -727,12 +811,12 @@ where
     }
 }
 
-/// See [`BasicPeeringStrategy::disconnect_addr`].
+/// See [`BasicPeeringStrategy::decrease_address_connections`].
 #[derive(Debug, derive_more::Display)]
-pub enum DisconnectAddrError {
+pub enum DecreaseAddressConnectionsError {
     /// Address isn't known to the collection.
     UnknownAddress,
-    /// The address was not in the "connected" state.
+    /// The address didn't have any connection.
     NotConnected,
 }
 
@@ -761,8 +845,7 @@ pub enum InsertChainPeerResult {
     Duplicate,
 }
 
-/// See [`BasicPeeringStrategy::insert_address`] and
-/// [`BasicPeeringStrategy::insert_or_set_connected_address`].
+/// See [`BasicPeeringStrategy::insert_address`].
 pub enum InsertAddressResult {
     /// Address has been successfully inserted.
     Inserted {
@@ -770,15 +853,182 @@ pub enum InsertAddressResult {
         /// removed. If so, this contains the address.
         address_removed: Option<Vec<u8>>,
     },
-    /// Address was already inserted.
-    Duplicate,
+    /// Address was already known.
+    AlreadyKnown,
     /// The peer isn't associated to any chain, and as such the address was not inserted.
     UnknownPeer,
 }
 
+/// See [`BasicPeeringStrategy::increase_address_connections`].
+pub enum InsertAddressConnectionsResult {
+    /// Address has been inserted.
+    Inserted {
+        /// If the maximum number of addresses is reached, an old address might have been
+        /// removed. If so, this contains the address.
+        address_removed: Option<Vec<u8>>,
+    },
+    /// Address was already known.
+    AlreadyKnown,
+}
+
+/// See [`BasicPeeringStrategy::unassign_slot_and_ban`].
+pub enum UnassignSlotAndBan<TInstant> {
+    /// Peer wasn't assigned to the given chain.
+    NotAssigned,
+    /// Peer was already banned.
+    AlreadyBanned {
+        /// When the peer is unbanned.
+        when_unban: TInstant,
+        /// `true` if the ban has been extended, in other words if the value of `when_unban` was
+        /// superior to the existing ban.
+        ban_extended: bool,
+    },
+    /// Peer wasn't banned and is now banned.
+    Banned {
+        /// `true` if the peer had a slot on the chain.
+        had_slot: bool,
+    },
+}
+
+impl<TInstant> UnassignSlotAndBan<TInstant> {
+    /// Returns `true` for [`UnassignSlotAndBan::Banned`] where `had_slot` is `true`.
+    pub fn had_slot(&self) -> bool {
+        matches!(self, UnassignSlotAndBan::Banned { had_slot: true })
+    }
+}
+
+/// See [`BasicPeeringStrategy::unassign_slot_and_remove_chain_peer`].
+pub enum UnassignSlotAndRemoveChainPeer<TInstant> {
+    /// Peer wasn't assigned to the given chain.
+    NotAssigned,
+    /// Peer was assigned to the given chain but didn't have a slot or was banned.
+    Assigned {
+        /// `Some` if the peer was banned. Contains the ban expiration.
+        ban_expiration: Option<TInstant>,
+    },
+    /// Peer was assigned to the given chain and had a slot.
+    HadSlot,
+}
+
+/// See [`BasicPeeringStrategy::unassign_slots_and_ban`].
+pub struct UnassignSlotsAndBanIter<'a, TChainId, TInstant>
+where
+    TInstant: PartialOrd + Ord + Eq + Clone,
+{
+    /// Same field as in [`BasicPeeringStrategy`].
+    chains: &'a slab::Slab<TChainId>,
+    /// Same field as in [`BasicPeeringStrategy`].
+    peers_chains_by_state: &'a mut BTreeSet<(usize, PeerChainState<TInstant>, usize)>,
+    /// Iterator within [`BasicPeeringStrategy::peers_chains`].
+    inner_iter:
+        Option<iter::Fuse<btree_map::RangeMut<'a, (usize, usize), PeerChainState<TInstant>>>>,
+    /// Parameter passed to [`BasicPeeringStrategy::unassign_slots_and_ban`]. Dummy value when
+    /// [`UnassignSlotsAndBanIter::inner_iter`] is `None`.
+    peer_id_index: usize,
+    /// Parameter passed to [`BasicPeeringStrategy::unassign_slots_and_ban`].
+    when_unban: TInstant,
+}
+
+/// See [`BasicPeeringStrategy::unassign_slots_and_ban`].
+pub enum UnassignSlotsAndBan<TInstant> {
+    /// Peer was already banned.
+    AlreadyBanned {
+        /// When the peer is unbanned.
+        when_unban: TInstant,
+        /// `true` if the ban has been extended, in other words if the value of `when_unban` was
+        /// superior to the existing ban.
+        ban_extended: bool,
+    },
+    /// Peer wasn't banned and is now banned.
+    Banned {
+        /// `true` if the peer had a slot on the chain.
+        had_slot: bool,
+    },
+}
+
+impl<'a, TChainId, TInstant> Iterator for UnassignSlotsAndBanIter<'a, TChainId, TInstant>
+where
+    TInstant: PartialOrd + Ord + Eq + Clone,
+{
+    type Item = (&'a TChainId, UnassignSlotsAndBan<TInstant>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Some(inner_iter) = self.inner_iter.as_mut() else {
+            return None;
+        };
+
+        loop {
+            let Some((&(_, chain_index), state)) = inner_iter.next() else {
+                return None;
+            };
+
+            let return_value = match state {
+                PeerChainState::Banned { expires } if *expires >= self.when_unban => {
+                    // Ban is already long enough. Nothing to do.
+                    return Some((
+                        &self.chains[chain_index],
+                        UnassignSlotsAndBan::AlreadyBanned {
+                            when_unban: expires.clone(),
+                            ban_extended: false,
+                        },
+                    ));
+                }
+                PeerChainState::Banned { .. } => UnassignSlotsAndBan::AlreadyBanned {
+                    when_unban: self.when_unban.clone(),
+                    ban_extended: true,
+                },
+                PeerChainState::Assignable => UnassignSlotsAndBan::Banned { had_slot: false },
+                PeerChainState::Slot => UnassignSlotsAndBan::Banned { had_slot: true },
+            };
+
+            let _was_in = self.peers_chains_by_state.remove(&(
+                chain_index,
+                state.clone(),
+                self.peer_id_index,
+            ));
+            debug_assert!(_was_in);
+
+            *state = PeerChainState::Banned {
+                expires: self.when_unban.clone(),
+            };
+
+            let _was_inserted =
+                self.peers_chains_by_state
+                    .insert((chain_index, state.clone(), self.peer_id_index));
+            debug_assert!(_was_inserted);
+
+            break Some((&self.chains[chain_index], return_value));
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner_iter
+            .as_ref()
+            .map_or((0, Some(0)), |inner| inner.size_hint())
+    }
+}
+
+impl<'a, TChainId, TInstant> iter::FusedIterator for UnassignSlotsAndBanIter<'a, TChainId, TInstant> where
+    TInstant: PartialOrd + Ord + Eq + Clone
+{
+}
+
+impl<'a, TChainId, TInstant> Drop for UnassignSlotsAndBanIter<'a, TChainId, TInstant>
+where
+    TInstant: PartialOrd + Ord + Eq + Clone,
+{
+    fn drop(&mut self) {
+        // Note that this is safe because `UnassignSlotsAndBanIter` is a `FusedIterator`.
+        while let Some(_) = self.next() {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BasicPeeringStrategy, Config, InsertAddressResult, InsertChainPeerResult};
+    use super::{
+        BasicPeeringStrategy, Config, InsertAddressConnectionsResult, InsertAddressResult,
+        InsertChainPeerResult,
+    };
     use crate::network::service::{peer_id::PublicKey, PeerId};
     use core::time::Duration;
 
@@ -820,6 +1070,79 @@ mod tests {
         assert_eq!(bps.peer_addresses(&peer_id).count(), 1);
         bps.unassign_slot_and_remove_chain_peer(&0, &peer_id);
         assert_eq!(bps.peer_addresses(&peer_id).count(), 0);
+    }
+
+    #[test]
+    fn addresses_not_removed_if_connected_when_peer_has_no_chain_association() {
+        let mut bps = BasicPeeringStrategy::<u32, Duration>::new(Config {
+            randomness_seed: [0; 32],
+            peers_capacity: 0,
+            chains_capacity: 0,
+        });
+
+        let peer_id = PeerId::from_public_key(&PublicKey::Ed25519([0; 32]));
+
+        assert!(matches!(
+            bps.insert_chain_peer(0, peer_id.clone(), usize::max_value()),
+            InsertChainPeerResult::Inserted { peer_removed: None }
+        ));
+
+        assert!(matches!(
+            bps.increase_address_connections(&peer_id, Vec::new(), usize::max_value()),
+            InsertAddressConnectionsResult::Inserted {
+                address_removed: None
+            }
+        ));
+
+        assert!(matches!(
+            bps.insert_address(&peer_id, vec![1], usize::max_value()),
+            InsertAddressResult::Inserted {
+                address_removed: None
+            }
+        ));
+
+        assert_eq!(bps.peer_addresses(&peer_id).count(), 2);
+        bps.unassign_slot_and_remove_chain_peer(&0, &peer_id);
+        assert_eq!(bps.peer_addresses(&peer_id).count(), 2);
+
+        bps.decrease_address_connections(&peer_id, &[]).unwrap();
+        assert_eq!(bps.peer_addresses(&peer_id).count(), 0);
+    }
+
+    #[test]
+    fn address_not_inserted_when_peer_has_no_chain_association() {
+        let mut bps = BasicPeeringStrategy::<u32, Duration>::new(Config {
+            randomness_seed: [0; 32],
+            peers_capacity: 0,
+            chains_capacity: 0,
+        });
+
+        let peer_id = PeerId::from_public_key(&PublicKey::Ed25519([0; 32]));
+
+        assert!(matches!(
+            bps.insert_address(&peer_id, Vec::new(), usize::max_value()),
+            InsertAddressResult::UnknownPeer
+        ));
+
+        assert_eq!(bps.peer_addresses(&peer_id).count(), 0);
+    }
+
+    #[test]
+    fn address_connections_inserted_when_peer_has_no_chain_association() {
+        let mut bps = BasicPeeringStrategy::<u32, Duration>::new(Config {
+            randomness_seed: [0; 32],
+            peers_capacity: 0,
+            chains_capacity: 0,
+        });
+
+        let peer_id = PeerId::from_public_key(&PublicKey::Ed25519([0; 32]));
+
+        assert!(matches!(
+            bps.increase_address_connections(&peer_id, Vec::new(), usize::max_value()),
+            InsertAddressConnectionsResult::Inserted { .. }
+        ));
+
+        assert_eq!(bps.peer_addresses(&peer_id).count(), 1);
     }
 
     // TODO: more tests
