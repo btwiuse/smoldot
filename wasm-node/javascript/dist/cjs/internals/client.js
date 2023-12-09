@@ -1,3 +1,4 @@
+"use strict";
 // Smoldot
 // Copyright (C) 2019-2022  Parity Technologies (UK) Ltd.
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
@@ -10,6 +11,8 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.start = void 0;
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
@@ -20,13 +23,13 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 // GNU General Public License for more details.
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
-import { QueueFullError, AlreadyDestroyedError, AddChainError, JsonRpcDisabledError, CrashError } from '../public-types.js';
-import * as instance from './local-instance.js';
-import * as remote from './remote-instance.js';
+const public_types_js_1 = require("../public-types.js");
+const instance = require("./local-instance.js");
+const remote = require("./remote-instance.js");
 // This function is similar to the `start` function found in `index.ts`, except with an extra
 // parameter containing the platform-specific bindings.
 // Contrary to the one within `index.js`, this function is not supposed to be directly used.
-export function start(options, wasmModule, platformBindings) {
+function start(options, wasmModule, platformBindings) {
     const logCallback = options.logCallback || ((level, target, message) => {
         // The first parameter of the methods of `console` has some printf-like substitution
         // capabilities. We don't really need to use this, but not using it means that the logs might
@@ -78,7 +81,7 @@ export function start(options, wasmModule, platformBindings) {
                     event.message);
                 state.instance = {
                     status: "destroyed",
-                    error: new CrashError(event.message),
+                    error: new public_types_js_1.CrashError(event.message),
                 };
                 state.connections.forEach((connec) => connec.reset());
                 state.connections.clear();
@@ -270,7 +273,7 @@ export function start(options, wasmModule, platformBindings) {
             let jsonRpcMaxPendingRequests = options.jsonRpcMaxPendingRequests === undefined ? Infinity : options.jsonRpcMaxPendingRequests;
             jsonRpcMaxPendingRequests = Math.floor(jsonRpcMaxPendingRequests);
             if (jsonRpcMaxPendingRequests <= 0 || isNaN(jsonRpcMaxPendingRequests)) {
-                throw new AddChainError("Invalid value for `jsonRpcMaxPendingRequests`");
+                throw new public_types_js_1.AddChainError("Invalid value for `jsonRpcMaxPendingRequests`");
             }
             if (jsonRpcMaxPendingRequests > 0xffffffff) {
                 jsonRpcMaxPendingRequests = 0xffffffff;
@@ -279,19 +282,19 @@ export function start(options, wasmModule, platformBindings) {
             let jsonRpcMaxSubscriptions = options.jsonRpcMaxSubscriptions === undefined ? Infinity : options.jsonRpcMaxSubscriptions;
             jsonRpcMaxSubscriptions = Math.floor(jsonRpcMaxSubscriptions);
             if (jsonRpcMaxSubscriptions < 0 || isNaN(jsonRpcMaxSubscriptions)) {
-                throw new AddChainError("Invalid value for `jsonRpcMaxSubscriptions`");
+                throw new public_types_js_1.AddChainError("Invalid value for `jsonRpcMaxSubscriptions`");
             }
             if (jsonRpcMaxSubscriptions > 0xffffffff) {
                 jsonRpcMaxSubscriptions = 0xffffffff;
             }
             // Sanitize `databaseContent`.
             if (options.databaseContent !== undefined && typeof options.databaseContent !== 'string')
-                throw new AddChainError("`databaseContent` is not a string");
+                throw new public_types_js_1.AddChainError("`databaseContent` is not a string");
             const promise = new Promise((resolve) => state.addChainResults.push(resolve));
             state.instance.instance.addChain(options.chainSpec, options.databaseContent || "", potentialRelayChainsIds, !!options.disableJsonRpc, jsonRpcMaxPendingRequests, jsonRpcMaxSubscriptions);
             const outcome = yield promise;
             if (!outcome.success)
-                throw new AddChainError(outcome.error);
+                throw new public_types_js_1.AddChainError(outcome.error);
             const chainId = outcome.chainId;
             state.chains.set(chainId, {
                 jsonRpcResponsesPromises: new Array()
@@ -303,22 +306,22 @@ export function start(options, wasmModule, platformBindings) {
                     if (state.instance.status !== "ready")
                         throw new Error(); // Internal error. Never supposed to happen.
                     if (!state.chains.has(chainId))
-                        throw new AlreadyDestroyedError();
+                        throw new public_types_js_1.AlreadyDestroyedError();
                     if (options.disableJsonRpc)
-                        throw new JsonRpcDisabledError();
+                        throw new public_types_js_1.JsonRpcDisabledError();
                     const retVal = state.instance.instance.request(request, chainId);
                     switch (retVal) {
                         case 0: break;
-                        case 1: throw new QueueFullError();
+                        case 1: throw new public_types_js_1.QueueFullError();
                         default: throw new Error("Internal error: unknown json_rpc_send error code: " + retVal);
                     }
                 },
                 nextJsonRpcResponse: () => __awaiter(this, void 0, void 0, function* () {
                     while (true) {
                         if (!state.chains.has(chainId))
-                            throw new AlreadyDestroyedError();
+                            throw new public_types_js_1.AlreadyDestroyedError();
                         if (options.disableJsonRpc)
-                            return Promise.reject(new JsonRpcDisabledError());
+                            return Promise.reject(new public_types_js_1.JsonRpcDisabledError());
                         if (state.instance.status === "destroyed")
                             throw state.instance.error;
                         if (state.instance.status !== "ready")
@@ -339,7 +342,7 @@ export function start(options, wasmModule, platformBindings) {
                     if (state.instance.status !== "ready")
                         throw new Error(); // Internal error. Never supposed to happen.
                     if (!state.chains.has(chainId))
-                        throw new AlreadyDestroyedError();
+                        throw new public_types_js_1.AlreadyDestroyedError();
                     console.assert(state.chainIds.has(newChain));
                     state.chainIds.delete(newChain);
                     for (const callback of state.chains.get(chainId).jsonRpcResponsesPromises) {
@@ -365,7 +368,7 @@ export function start(options, wasmModule, platformBindings) {
             // In case the instance crashes while we were waiting, we don't want to overwrite
             // the error.
             if (state.instance.status === "ready")
-                state.instance = { status: "destroyed", error: new AlreadyDestroyedError() };
+                state.instance = { status: "destroyed", error: new public_types_js_1.AlreadyDestroyedError() };
             state.connections.forEach((connec) => connec.reset());
             state.connections.clear();
             for (const addChainResult of state.addChainResults) {
@@ -382,3 +385,4 @@ export function start(options, wasmModule, platformBindings) {
         })
     };
 }
+exports.start = start;

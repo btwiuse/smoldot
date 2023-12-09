@@ -1,3 +1,4 @@
+"use strict";
 // Smoldot
 // Copyright (C) 2023  Pierre Krieger
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
@@ -10,6 +11,8 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.startInstanceServer = exports.connectToInstanceServer = void 0;
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
@@ -30,7 +33,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 // - JSON-RPC requests aren't sent back lazily one at a time. Instead, the client indicates that it
 //   is ready to accept more JSON-RPC responses, after which the server can send responses at any
 //   time and the client queues them locally.
-import * as instance from './local-instance.js';
+const instance = require("./local-instance.js");
 // Implementation note: it is unclear even in the official specification
 // (https://html.spec.whatwg.org/multipage/web-messaging.html) whether both sides of a
 // `MessagePort` should be closed, or if one is enough.
@@ -39,7 +42,7 @@ import * as instance from './local-instance.js';
 // message on Firefox (but it does on Chrome). The code below takes note of this, and only closes
 // a port upon *receiving* the last possible message. It therefore assumes that closing only one
 // side is enough. It is unclear whether this causes any memory leak.
-export function connectToInstanceServer(config) {
+function connectToInstanceServer(config) {
     return __awaiter(this, void 0, void 0, function* () {
         // Send the wasm module and configuration to the server.
         // Note that we await the `wasmModule` `Promise` here.
@@ -201,13 +204,14 @@ export function connectToInstanceServer(config) {
         };
     });
 }
+exports.connectToInstanceServer = connectToInstanceServer;
 /**
  * Returns a `Promise` that resolves when the instance shuts down. Since the function is also
  * an asynchronous function, the actual return type is `Promise<Promise<void>>`. That is, the
  * outer `Promise` yields once the instance starts, and the inner `Promise` yields once the
  * instance shuts down.
  */
-export function startInstanceServer(config, initPortToClient) {
+function startInstanceServer(config, initPortToClient) {
     return __awaiter(this, void 0, void 0, function* () {
         const { serverToClient: portToClient, wasmModule, maxLogLevel, cpuRateLimit, forbidTcp, forbidWs, forbidWss, forbidNonLocalWs, forbidWebRtc } = yield new Promise((resolve) => {
             initPortToClient.onmessage = (event) => resolve(event.data);
@@ -368,3 +372,4 @@ export function startInstanceServer(config, initPortToClient) {
         return execFinishedPromise;
     });
 }
+exports.startInstanceServer = startInstanceServer;

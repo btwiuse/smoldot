@@ -1,3 +1,4 @@
+"use strict";
 // Smoldot
 // Copyright (C) 2019-2022  Parity Technologies (UK) Ltd.
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
@@ -10,6 +11,8 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.startLocalInstance = void 0;
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
@@ -20,7 +23,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 // GNU General Public License for more details.
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
-import * as buffer from './buffer.js';
+const buffer = require("./buffer.js");
 /**
  * Starts a new instance using the given configuration.
  *
@@ -33,7 +36,7 @@ import * as buffer from './buffer.js';
  * This instance is low-level in the sense that invalid input can lead to crashes and that input
  * isn't sanitized. In other words, you know what you're doing.
  */
-export function startLocalInstance(config, wasmModule, eventCallback) {
+function startLocalInstance(config, wasmModule, eventCallback) {
     return __awaiter(this, void 0, void 0, function* () {
         const state = {
             instance: null,
@@ -451,3 +454,4 @@ export function startLocalInstance(config, wasmModule, eventCallback) {
         };
     });
 }
+exports.startLocalInstance = startLocalInstance;

@@ -1,3 +1,4 @@
+"use strict";
 // Smoldot
 // Copyright (C) 2019-2022  Parity Technologies (UK) Ltd.
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
@@ -10,8 +11,15 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
-import { start as innerStart } from './internals/client.js';
-export { AddChainError, AlreadyDestroyedError, CrashError, JsonRpcDisabledError, QueueFullError } from './public-types.js';
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.startWithBytecode = exports.QueueFullError = exports.JsonRpcDisabledError = exports.CrashError = exports.AlreadyDestroyedError = exports.AddChainError = void 0;
+const client_js_1 = require("./internals/client.js");
+var public_types_js_1 = require("./public-types.js");
+Object.defineProperty(exports, "AddChainError", { enumerable: true, get: function () { return public_types_js_1.AddChainError; } });
+Object.defineProperty(exports, "AlreadyDestroyedError", { enumerable: true, get: function () { return public_types_js_1.AlreadyDestroyedError; } });
+Object.defineProperty(exports, "CrashError", { enumerable: true, get: function () { return public_types_js_1.CrashError; } });
+Object.defineProperty(exports, "JsonRpcDisabledError", { enumerable: true, get: function () { return public_types_js_1.JsonRpcDisabledError; } });
+Object.defineProperty(exports, "QueueFullError", { enumerable: true, get: function () { return public_types_js_1.QueueFullError; } });
 /**
  * Initializes a new client. This is a pre-requisite to connecting to a blockchain.
  *
@@ -19,7 +27,7 @@ export { AddChainError, AlreadyDestroyedError, CrashError, JsonRpcDisabledError,
  *
  * @param options Configuration of the client.
  */
-export function startWithBytecode(options) {
+function startWithBytecode(options) {
     options.forbidTcp = true;
     // When in a secure context, browsers refuse to open non-secure WebSocket connections to
     // non-localhost. There is an exception if the page is localhost, in which case all connections
@@ -34,7 +42,7 @@ export function startWithBytecode(options) {
             options.forbidNonLocalWs = true;
         }
     }
-    return innerStart(options, options.bytecode, {
+    return (0, client_js_1.start)(options, options.bytecode, {
         performanceNow: () => {
             return performance.now();
         },
@@ -58,6 +66,7 @@ export function startWithBytecode(options) {
         }
     });
 }
+exports.startWithBytecode = startWithBytecode;
 /**
  * Tries to open a new connection using the given configuration.
  *

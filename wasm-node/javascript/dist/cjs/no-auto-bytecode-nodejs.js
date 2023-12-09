@@ -1,12 +1,20 @@
+"use strict";
 // Smoldot
 // Copyright (C) 2019-2022  Parity Technologies (UK) Ltd.
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
-import { start as innerStart } from './internals/client.js';
-import { WebSocket } from 'ws';
-import { performance } from 'node:perf_hooks';
-import { createConnection as nodeCreateConnection } from 'node:net';
-import { randomFillSync } from 'node:crypto';
-export { AddChainError, AlreadyDestroyedError, CrashError, QueueFullError, JsonRpcDisabledError } from './public-types.js';
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.startWithBytecode = exports.JsonRpcDisabledError = exports.QueueFullError = exports.CrashError = exports.AlreadyDestroyedError = exports.AddChainError = void 0;
+const client_js_1 = require("./internals/client.js");
+const ws_1 = require("ws");
+const node_perf_hooks_1 = require("node:perf_hooks");
+const node_net_1 = require("node:net");
+const node_crypto_1 = require("node:crypto");
+var public_types_js_1 = require("./public-types.js");
+Object.defineProperty(exports, "AddChainError", { enumerable: true, get: function () { return public_types_js_1.AddChainError; } });
+Object.defineProperty(exports, "AlreadyDestroyedError", { enumerable: true, get: function () { return public_types_js_1.AlreadyDestroyedError; } });
+Object.defineProperty(exports, "CrashError", { enumerable: true, get: function () { return public_types_js_1.CrashError; } });
+Object.defineProperty(exports, "QueueFullError", { enumerable: true, get: function () { return public_types_js_1.QueueFullError; } });
+Object.defineProperty(exports, "JsonRpcDisabledError", { enumerable: true, get: function () { return public_types_js_1.JsonRpcDisabledError; } });
 /**
  * Initializes a new client. This is a pre-requisite to connecting to a blockchain.
  *
@@ -14,22 +22,23 @@ export { AddChainError, AlreadyDestroyedError, CrashError, QueueFullError, JsonR
  *
  * @param options Configuration of the client.
  */
-export function startWithBytecode(options) {
+function startWithBytecode(options) {
     options.forbidWebRtc = true;
-    return innerStart(options || {}, options.bytecode, {
+    return (0, client_js_1.start)(options || {}, options.bytecode, {
         performanceNow: () => {
-            return performance.now();
+            return node_perf_hooks_1.performance.now();
         },
         getRandomValues: (buffer) => {
             if (buffer.length >= 1024 * 1024)
                 throw new Error('getRandomValues buffer too large');
-            randomFillSync(buffer);
+            (0, node_crypto_1.randomFillSync)(buffer);
         },
         connect: (config) => {
             return connect(config);
         }
     });
 }
+exports.startWithBytecode = startWithBytecode;
 /**
  * Tries to open a new connection using the given configuration.
  *
@@ -38,7 +47,7 @@ export function startWithBytecode(options) {
  */
 function connect(config) {
     if (config.address.ty === "websocket") {
-        const socket = new WebSocket(config.address.url);
+        const socket = new ws_1.WebSocket(config.address.url);
         socket.binaryType = 'arraybuffer';
         const bufferedAmountCheck = { quenedUnreportedBytes: 0, nextTimeout: 10 };
         const checkBufferedAmount = () => {
@@ -111,7 +120,7 @@ function connect(config) {
         };
     }
     else if (config.address.ty === "tcp") {
-        const socket = nodeCreateConnection({
+        const socket = (0, node_net_1.createConnection)({
             host: config.address.hostname,
             port: config.address.port,
         });
