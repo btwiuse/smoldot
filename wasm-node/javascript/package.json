@@ -1,5 +1,5 @@
 {
-  "name": "smoldot",
+  "name": "turandot",
   "version": "2.0.13",
   "description": "Light client that connects to Polkadot and Substrate-based blockchains",
   "contributors": [
