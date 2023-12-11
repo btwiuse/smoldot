@@ -58,7 +58,7 @@ impl InterpreterPrototype {
             let mut config = wasmi::Config::default();
 
             // Disable all the post-MVP wasm features.
-            config.wasm_sign_extension(false);
+            config.wasm_sign_extension(true);
             config.wasm_reference_types(false);
             config.wasm_bulk_memory(false);
             config.wasm_multi_value(false);
